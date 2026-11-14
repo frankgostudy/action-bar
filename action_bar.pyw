@@ -1354,7 +1354,9 @@ class ActionBar:
         self._hide_job = None
         self._tip = None
         self._tip_frame = None
+        self._tip_label = None
         self._tip_show_job = None
+        self._tip_show_frame = None
         self._tip_hide_job = None
         self._tip_watch_job = None
         self._hotkey_ok = False
@@ -1778,6 +1780,7 @@ class ActionBar:
             except tk.TclError:
                 pass
             self._tip_show_job = None
+        self._tip_show_frame = None
 
     def _cancel_tip_hide(self) -> None:
         if self._tip_hide_job is not None:
@@ -1794,8 +1797,12 @@ class ActionBar:
         self._cancel_tip_hide()
         if self._tip is not None and self._tip_frame is frame:
             return
+        if self._tip_show_job is not None and self._tip_show_frame is frame:
+            return
         self._cancel_tip_show()
-        self._tip_show_job = self.root.after(180, lambda box=frame, text=name: self._show_tip(box, text))
+        delay = 20 if self._tip is not None else 180
+        self._tip_show_frame = frame
+        self._tip_show_job = self.root.after(delay, lambda box=frame, text=name: self._show_tip(box, text))
 
     def _schedule_tip_hide(self) -> None:
         self._cancel_tip_show()
@@ -1871,6 +1878,7 @@ class ActionBar:
 
     def _show_tip(self, frame, text: str) -> None:
         self._tip_show_job = None
+        self._tip_show_frame = None
         if not frame.winfo_exists() or not self._pointer_inside(frame):
             return
         if self._tip is not None and self._tip_frame is frame:
@@ -1880,12 +1888,26 @@ class ActionBar:
                     return
             except tk.TclError:
                 pass
+        if self._tip is not None and self._tip_label is not None:
+            try:
+                if self._tip.winfo_exists():
+                    self._tip_label.configure(text=text)
+                    self._tip.update_idletasks()
+                    width, height = self._tip.winfo_reqwidth(), self._tip.winfo_reqheight()
+                    x, y = self._tip_origin(frame, width, height)
+                    self._tip.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
+                    self._raise_tip()
+                    self._tip_frame = frame
+                    self._arm_tip_watch()
+                    return
+            except tk.TclError:
+                pass
         self._close_tip_window()
         tip = tk.Toplevel(self.root)
         tip.overrideredirect(True)
         tip.attributes("-topmost", True)
         tip.configure(bg="#000000")
-        tk.Label(
+        label = tk.Label(
             tip,
             text=text,
             bg="#000000",
@@ -1893,7 +1915,8 @@ class ActionBar:
             font=("Microsoft JhengHei UI", 9, "bold"),
             padx=8,
             pady=3,
-        ).pack()
+        )
+        label.pack()
         tip.withdraw()
         tip.update_idletasks()
         width, height = tip.winfo_reqwidth(), tip.winfo_reqheight()
@@ -1920,6 +1943,7 @@ class ActionBar:
         except tk.TclError:
             pass
         self._tip = tip
+        self._tip_label = label
         self._tip_frame = frame
         self._arm_tip_watch()
 
@@ -1958,10 +1982,22 @@ class ActionBar:
     def _tip_watch(self) -> None:
         self._tip_watch_job = None
         frame = self._tip_frame
-        if frame is None or not frame.winfo_exists() or not self._pointer_inside(frame):
-            if frame is not None and frame.winfo_exists() and not frame._busy:
+        exists = False
+        if frame is not None:
+            try:
+                exists = bool(frame.winfo_exists())
+            except tk.TclError:
+                exists = False
+        if frame is None or not exists:
+            self._hide_tip()
+            return
+        if not self._pointer_inside(frame):
+            if not frame._busy:
                 frame._pressed = False
                 self._paint_key_normal(frame)
+            if self._tip_show_job is not None or self._tip_hide_job is not None:
+                self._arm_tip_watch()
+                return
             self._hide_tip()
             return
         name = str(getattr(frame, "_tip_name", "") or "")
@@ -1980,6 +2016,7 @@ class ActionBar:
         tip = self._tip
         self._tip = None
         self._tip_frame = None
+        self._tip_label = None
         if tip is not None:
             try:
                 tip.destroy()
