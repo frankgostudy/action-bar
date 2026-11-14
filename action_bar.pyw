@@ -1457,6 +1457,7 @@ class ActionBar:
             user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | needed)
             flags |= SWP_FRAMECHANGED
         user32.SetWindowPos(hwnd, topmost_handle(), 0, 0, 0, 0, flags)
+        self._raise_tip()
 
     def _allow_activate(self, allow: bool) -> None:
         if not self.hwnd:
@@ -1476,6 +1477,7 @@ class ActionBar:
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         )
+        self._raise_tip()
 
     def register_toggle(self) -> None:
         if not self.hwnd:
@@ -1815,6 +1817,19 @@ class ActionBar:
     def _rects_hit(self, a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
         return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
 
+    def _raise_tip(self) -> None:
+        tip = self._tip
+        if tip is None:
+            return
+        try:
+            if not tip.winfo_exists():
+                return
+            hwnd = native_hwnd(tip.winfo_id())
+        except tk.TclError:
+            return
+        if hwnd:
+            user32.SetWindowPos(hwnd, topmost_handle(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
     def _tip_origin(self, frame, width: int, height: int) -> tuple[int, int]:
         left, top = frame.winfo_rootx(), frame.winfo_rooty()
         box_w, box_h = frame.winfo_width(), frame.winfo_height()
@@ -1826,7 +1841,7 @@ class ActionBar:
         cursor = (pointer_x - 6, pointer_y - 6, pointer_x + 48, pointer_y + 48)
         button = (left, top, left + box_w, top + box_h)
         spots: list[tuple[int, int]] = []
-        for gap in (10, 24, 44):
+        for gap in (6, 14):
             spots.extend(
                 (
                     (left - width - gap, top - height - gap),
@@ -1850,9 +1865,6 @@ class ActionBar:
         clear = [(x, y) for x, y in spots if on_screen(x, y) and not blocked(x, y)]
         if clear:
             return int(clear[0][0]), int(clear[0][1])
-        visible = [(x, y) for x, y in spots if on_screen(x, y) and not self._rects_hit((x, y, x + width, y + height), button)]
-        if visible:
-            return int(visible[0][0]), int(visible[0][1])
         x = max(mon[0] + 4, min(spots[0][0], mon[2] - width - 4))
         y = max(mon[1] + 4, min(spots[0][1], mon[3] - height - 4))
         return int(x), int(y)
@@ -2485,6 +2497,9 @@ class ActionBar:
                 self.root.attributes("-topmost", True)
             if self.hwnd and self._editors <= 0:
                 self._apply_exstyle(self.hwnd)
+            self._raise_tip()
+            if self._tip is not None:
+                self.root.after(1, self._raise_tip)
         except Exception:
             log_exc()
         if self._alive:
