@@ -7,6 +7,7 @@
 按「選」管理快捷鍵。一般群組列出全部快捷鍵。同一組合在不同群組可以有不同名稱。
 頁籤「已勾選」只列出有打勾的鍵。可儲存或載入目前的勾選。勾選後立刻套用。
 按 — 縮到工作列旁的小圖示。按 × 結束程式。按齒輪可開關左鍵連點貼上、右鍵連點複製。
+快捷列最上方第一列是 PgUp、PgDn、Home、End、上、下，第二列是 Bksp、Del、Tab、Enter、左、右。滑鼠停在常用鍵上時，名稱以黑底白字顯示，直到滑鼠離開。
 
 快捷鍵寫法：ctrl+c、win+shift+s、ctrl+alt+shift+h。只含減號時也可寫 ctrl-c。
 """
@@ -113,9 +114,11 @@ GWL_EXSTYLE = -20
 GWLP_WNDPROC = -4
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_TRANSPARENT = 0x00000020
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
 SWP_FRAMECHANGED = 0x0020
 HWND_TOPMOST = -1
 INPUT_KEYBOARD = 1
@@ -813,13 +816,13 @@ def monitor_rect(x: int, y: int) -> tuple[int, int, int, int]:
     return 0, 0, int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
 
 
-def column_count(count: int, vertical: bool, mon: tuple[int, int, int, int]) -> int:
+def column_count(count: int, vertical: bool, mon: tuple[int, int, int, int], reserve: int = 0) -> int:
     if count <= 0:
         return 1
     mon_w = mon[2] - mon[0]
     mon_h = mon[3] - mon[1]
     if vertical:
-        avail_h = max(160, mon_h - 52)
+        avail_h = max(160, mon_h - 52 - reserve)
         cols = 1
         while math.ceil(count / cols) * 36 > avail_h and cols < 8:
             cols += 1
@@ -1349,6 +1352,11 @@ class ActionBar:
         self._proc = None
         self._menu = None
         self._hide_job = None
+        self._tip = None
+        self._tip_frame = None
+        self._tip_show_job = None
+        self._tip_hide_job = None
+        self._tip_watch_job = None
         self._hotkey_ok = False
         self._mouse_hook = None
         self._mouse_proc = None
@@ -1507,6 +1515,7 @@ class ActionBar:
         return monitor_rect(cursor_x, cursor_y)
 
     def relayout(self) -> None:
+        self._hide_tip()
         for child in self.tools.winfo_children():
             child.destroy()
         for child in self.body.winfo_children():
@@ -1515,15 +1524,16 @@ class ActionBar:
         specs = visible_specs(self.config, self.shortcuts)
         vertical = self.config.get("orientation") == "vertical"
         mon = self._target_monitor()
-        cols = column_count(len(specs), vertical, mon) if specs else 1
+        cols = column_count(len(specs), vertical, mon, reserve=88) if specs else 1
+        self._build_nav_pad().grid(row=0, column=0, columnspan=cols, padx=2, pady=(2, 4))
         if not specs:
             empty = tk.Label(self.body, text="沒有選擇快捷鍵", bg=BAR, fg=HINT, font=FONT, padx=16, pady=12)
-            empty.grid(row=0, column=0)
+            empty.grid(row=1, column=0)
             empty.bind("<Button-3>", self._open_bar_menu)
         else:
             for index, spec in enumerate(specs):
                 self._make_key(spec, vertical).grid(
-                    row=index // cols,
+                    row=1 + index // cols,
                     column=index % cols,
                     padx=2,
                     pady=2,
@@ -1610,6 +1620,74 @@ class ActionBar:
                     lambda event, widget=label, cmd=command: cmd() if inside(widget, event) else None,
                 )
 
+    def _build_nav_pad(self) -> tk.Frame:
+        pad = tk.Frame(self.body, bg=BAR)
+        text_rows = (
+            (
+                ("pageup", "PgUp", "PGUP"),
+                ("pagedown", "PgDn", "PGDN"),
+                ("home", "Home", "HOME"),
+                ("end", "End", "END"),
+            ),
+            (
+                ("backspace", "Bksp", "BKSP"),
+                ("delete", "Del", "DEL"),
+                ("tab", "\u21e5", "TAB"),
+                ("enter", "\u23ce", "ENTER"),
+            ),
+        )
+        arrows = (
+            (("up", "\u25b2", "UP"), ("down", "\u25bc", "DOWN")),
+            (("left", "\u25c0", "LEFT"), ("right", "\u25b6", "RIGHT")),
+        )
+        for row_index, keys in enumerate(text_rows):
+            for column, (hotkey, glyph, tip_name) in enumerate(keys):
+                self._make_icon_key(pad, hotkey, glyph, tip_name).grid(row=row_index, column=column, padx=2, pady=2)
+        for row_index, keys in enumerate(arrows):
+            for column, (hotkey, glyph, tip_name) in enumerate(keys):
+                self._make_icon_key(pad, hotkey, glyph, tip_name).grid(
+                    row=row_index, column=4 + column, padx=2, pady=2
+                )
+        return pad
+
+    def _make_icon_key(self, parent, hotkey: str, glyph: str, tip_name: str) -> tk.Frame:
+        spec = {"id": "nav-" + hotkey, "group": "常用鍵", "label": glyph, "hotkey": hotkey}
+        bg = "#e7eee8"
+        font = ("Segoe UI Symbol", 12) if len(glyph) == 1 else ("Microsoft JhengHei UI", 8, "bold")
+        frame = tk.Frame(
+            parent,
+            bg=bg,
+            width=48,
+            height=30,
+            cursor="hand2",
+            takefocus=False,
+            highlightthickness=1,
+            highlightbackground="#9aa89a",
+        )
+        frame.pack_propagate(False)
+        frame.grid_propagate(False)
+        title = tk.Label(frame, text=glyph, bg=bg, fg="#1b1c20", font=font, takefocus=False)
+        title.place(relx=0.5, rely=0.5, anchor="center")
+        frame._bg = bg
+        frame._fg = "#1b1c20"
+        frame._hover = "#174ea6"
+        frame._edge = "#9aa89a"
+        frame._tip_name = tip_name
+        frame._label = title
+        frame._hint = None
+        frame._hint_text = ""
+        frame._hint_fg = "#ffffff"
+        frame._pressed = False
+        frame._busy = False
+        frame._gen = 0
+        for widget in (frame, title):
+            widget.bind("<ButtonPress-1>", lambda _event, box=frame: self._press_key(box))
+            widget.bind("<ButtonRelease-1>", lambda event, box=frame, item=spec: self._release_key(event, box, item))
+            widget.bind("<Enter>", lambda _event, box=frame: self._hover_key(box, True))
+            widget.bind("<Leave>", lambda _event, box=frame: self._hover_key(box, False))
+            widget.bind("<Button-3>", self._open_bar_menu)
+        return frame
+
     def _make_key(self, spec: dict, vertical: bool) -> tk.Frame:
         bg = BTN
         try:
@@ -1637,6 +1715,7 @@ class ActionBar:
             title.pack(pady=(5, 0))
             subtitle.pack()
         frame._bg = bg
+        frame._fg = TEXT
         frame._hover = lighten(bg)
         frame._label = title
         frame._hint = subtitle
@@ -1658,23 +1737,253 @@ class ActionBar:
             return
         frame.configure(bg=bg)
         frame._label.configure(bg=bg, fg=fg)
-        frame._hint.configure(bg=bg, fg=hint_fg)
+        edge = getattr(frame, "_edge", None)
+        if edge:
+            frame.configure(highlightbackground=edge if bg == frame._bg else bg)
+        if frame._hint is not None:
+            frame._hint.configure(bg=bg, fg=hint_fg)
 
     def _paint_key_normal(self, frame) -> None:
         if frame.winfo_exists():
-            self._paint_key(frame, frame._bg, TEXT, frame._hint_fg)
+            self._paint_key(frame, frame._bg, frame._fg, frame._hint_fg)
+
+    def _pointer_inside(self, frame) -> bool:
+        try:
+            pointer_x, pointer_y = frame.winfo_pointerxy()
+            left, top = frame.winfo_rootx(), frame.winfo_rooty()
+        except tk.TclError:
+            return False
+        return left <= pointer_x < left + frame.winfo_width() and top <= pointer_y < top + frame.winfo_height()
 
     def _hover_key(self, frame, entering: bool) -> None:
         if not frame.winfo_exists() or frame._busy:
             return
         if not entering:
+            if self._pointer_inside(frame):
+                return
             frame._pressed = False
             self._paint_key_normal(frame)
-        elif not frame._pressed:
-            self._paint_key(frame, frame._hover, TEXT, frame._hint_fg)
+            self._schedule_tip_hide()
+            return
+        if not frame._pressed:
+            self._paint_key(frame, frame._hover, "#ffffff", "#ffffff")
+        self._schedule_tip(frame)
+
+    def _cancel_tip_show(self) -> None:
+        if self._tip_show_job is not None:
+            try:
+                self.root.after_cancel(self._tip_show_job)
+            except tk.TclError:
+                pass
+            self._tip_show_job = None
+
+    def _cancel_tip_hide(self) -> None:
+        if self._tip_hide_job is not None:
+            try:
+                self.root.after_cancel(self._tip_hide_job)
+            except tk.TclError:
+                pass
+            self._tip_hide_job = None
+
+    def _schedule_tip(self, frame) -> None:
+        name = str(getattr(frame, "_tip_name", "") or "")
+        if not name:
+            return
+        self._cancel_tip_hide()
+        if self._tip is not None and self._tip_frame is frame:
+            return
+        self._cancel_tip_show()
+        self._tip_show_job = self.root.after(180, lambda box=frame, text=name: self._show_tip(box, text))
+
+    def _schedule_tip_hide(self) -> None:
+        self._cancel_tip_show()
+        if self._tip is None and self._tip_hide_job is None:
+            return
+        self._cancel_tip_hide()
+        self._tip_hide_job = self.root.after(80, self._finish_tip_hide)
+
+    def _finish_tip_hide(self) -> None:
+        self._tip_hide_job = None
+        frame = self._tip_frame
+        if frame is not None and frame.winfo_exists() and self._pointer_inside(frame):
+            return
+        if frame is not None and frame.winfo_exists() and not frame._busy:
+            frame._pressed = False
+            self._paint_key_normal(frame)
+        self._hide_tip()
+
+    def _rects_hit(self, a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+        return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+    def _tip_origin(self, frame, width: int, height: int) -> tuple[int, int]:
+        left, top = frame.winfo_rootx(), frame.winfo_rooty()
+        box_w, box_h = frame.winfo_width(), frame.winfo_height()
+        mon = monitor_rect(left, top)
+        try:
+            pointer_x, pointer_y = frame.winfo_pointerxy()
+        except tk.TclError:
+            pointer_x, pointer_y = left + box_w // 2, top + box_h // 2
+        cursor = (pointer_x - 6, pointer_y - 6, pointer_x + 48, pointer_y + 48)
+        button = (left, top, left + box_w, top + box_h)
+        spots: list[tuple[int, int]] = []
+        for gap in (10, 24, 44):
+            spots.extend(
+                (
+                    (left - width - gap, top - height - gap),
+                    (left - width - gap, top + (box_h - height) // 2),
+                    (left + (box_w - width) // 2, top - height - gap),
+                    (left + box_w + gap, top - height - gap),
+                    (left + box_w + gap, top + (box_h - height) // 2),
+                    (left - width - gap, top + box_h + gap),
+                    (left + (box_w - width) // 2, top + box_h + gap),
+                    (left + box_w + gap, top + box_h + gap),
+                )
+            )
+
+        def on_screen(x: int, y: int) -> bool:
+            return mon[0] + 4 <= x and mon[1] + 4 <= y and x + width <= mon[2] - 4 and y + height <= mon[3] - 4
+
+        def blocked(x: int, y: int) -> bool:
+            rect = (x, y, x + width, y + height)
+            return self._rects_hit(rect, cursor) or self._rects_hit(rect, button)
+
+        clear = [(x, y) for x, y in spots if on_screen(x, y) and not blocked(x, y)]
+        if clear:
+            return int(clear[0][0]), int(clear[0][1])
+        visible = [(x, y) for x, y in spots if on_screen(x, y) and not self._rects_hit((x, y, x + width, y + height), button)]
+        if visible:
+            return int(visible[0][0]), int(visible[0][1])
+        x = max(mon[0] + 4, min(spots[0][0], mon[2] - width - 4))
+        y = max(mon[1] + 4, min(spots[0][1], mon[3] - height - 4))
+        return int(x), int(y)
+
+    def _show_tip(self, frame, text: str) -> None:
+        self._tip_show_job = None
+        if not frame.winfo_exists() or not self._pointer_inside(frame):
+            return
+        if self._tip is not None and self._tip_frame is frame:
+            try:
+                if self._tip.winfo_exists():
+                    self._arm_tip_watch()
+                    return
+            except tk.TclError:
+                pass
+        self._close_tip_window()
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tip.configure(bg="#000000")
+        tk.Label(
+            tip,
+            text=text,
+            bg="#000000",
+            fg="#ffffff",
+            font=("Microsoft JhengHei UI", 9, "bold"),
+            padx=8,
+            pady=3,
+        ).pack()
+        tip.withdraw()
+        tip.update_idletasks()
+        width, height = tip.winfo_reqwidth(), tip.winfo_reqheight()
+        x, y = self._tip_origin(frame, width, height)
+        tip.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
+        tip.attributes("-alpha", 1.0)
+        hwnd = native_hwnd(tip.winfo_id())
+        if hwnd:
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = (style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) & ~WS_EX_TRANSPARENT
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            user32.SetWindowPos(
+                hwnd,
+                topmost_handle(),
+                int(x),
+                int(y),
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        tip.deiconify()
+        try:
+            tip.attributes("-alpha", 1.0)
+        except tk.TclError:
+            pass
+        self._tip = tip
+        self._tip_frame = frame
+        self._arm_tip_watch()
+
+    def _place_tip(self, tip, frame) -> None:
+        try:
+            if not tip.winfo_exists():
+                return
+            width, height = tip.winfo_width(), tip.winfo_height()
+            current = (tip.winfo_x(), tip.winfo_y(), tip.winfo_x() + width, tip.winfo_y() + height)
+        except tk.TclError:
+            return
+        left, top = frame.winfo_rootx(), frame.winfo_rooty()
+        button = (left, top, left + frame.winfo_width(), top + frame.winfo_height())
+        try:
+            pointer_x, pointer_y = frame.winfo_pointerxy()
+        except tk.TclError:
+            return
+        cursor = (pointer_x - 6, pointer_y - 6, pointer_x + 48, pointer_y + 48)
+        if not self._rects_hit(current, cursor) and not self._rects_hit(current, button):
+            return
+        x, y = self._tip_origin(frame, width, height)
+        tip.geometry(f"+{int(x)}+{int(y)}")
+
+    def _arm_tip_watch(self) -> None:
+        if self._tip_watch_job is None:
+            self._tip_watch_job = self.root.after(120, self._tip_watch)
+
+    def _cancel_tip_watch(self) -> None:
+        if self._tip_watch_job is not None:
+            try:
+                self.root.after_cancel(self._tip_watch_job)
+            except tk.TclError:
+                pass
+            self._tip_watch_job = None
+
+    def _tip_watch(self) -> None:
+        self._tip_watch_job = None
+        frame = self._tip_frame
+        if frame is None or not frame.winfo_exists() or not self._pointer_inside(frame):
+            if frame is not None and frame.winfo_exists() and not frame._busy:
+                frame._pressed = False
+                self._paint_key_normal(frame)
+            self._hide_tip()
+            return
+        name = str(getattr(frame, "_tip_name", "") or "")
+        alive = False
+        if self._tip is not None and self._tip_frame is frame:
+            try:
+                alive = bool(self._tip.winfo_exists())
+            except tk.TclError:
+                alive = False
+        if name and not alive:
+            self._show_tip(frame, name)
+        if self._tip_watch_job is None:
+            self._tip_watch_job = self.root.after(120, self._tip_watch)
+
+    def _close_tip_window(self) -> None:
+        tip = self._tip
+        self._tip = None
+        self._tip_frame = None
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+
+    def _hide_tip(self) -> None:
+        self._cancel_tip_show()
+        self._cancel_tip_hide()
+        self._cancel_tip_watch()
+        self._close_tip_window()
 
     def _press_key(self, frame) -> None:
         frame._pressed = True
+        if not getattr(frame, "_tip_name", ""):
+            self._hide_tip()
         self._paint_key(frame, PRESS, "#ffffff", "#ffffff")
 
     def _release_key(self, event, frame, spec: dict) -> None:
@@ -1692,7 +2001,7 @@ class ActionBar:
         frame._gen += 1
         generation = frame._gen
         frame._busy = True
-        if message:
+        if message and frame._hint is not None:
             frame._hint.configure(text=message)
         self._paint_key(frame, PRESS if ok else BAD, "#ffffff", "#ffffff")
 
@@ -1700,8 +2009,12 @@ class ActionBar:
             if not frame.winfo_exists() or frame._gen != generation:
                 return
             frame._busy = False
-            frame._hint.configure(text=frame._hint_text)
-            self._paint_key_normal(frame)
+            if frame._hint is not None:
+                frame._hint.configure(text=frame._hint_text)
+            if getattr(frame, "_tip_name", "") and self._pointer_inside(frame):
+                self._paint_key(frame, frame._hover, "#ffffff", "#ffffff")
+            else:
+                self._paint_key_normal(frame)
 
         frame.after(900 if message else 140, restore)
 
