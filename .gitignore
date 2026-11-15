@@ -3,6 +3,8 @@ __pycache__/
 error.log
 *.tmp
 *.broken.json
+config.json
+shortcuts.json
 shortcuts.*.json
 shortcuts.before-groups.json
 快捷鍵設定.json

@@ -1,3 +1,100 @@
+﻿@echo off
+cd /d "%~dp0"
+set "SRC=%~f0"
+where python >nul 2>&1
+if %errorlevel%==0 goto :runpy
+where py >nul 2>&1
+if %errorlevel%==0 goto :runpy3
+echo Python 3 was not found. Install it and tick "Add python.exe to PATH".
+exit /b 1
+:runpy
+python -c "import pathlib; p = pathlib.Path(r'%SRC%'); t = p.read_text(encoding='utf-8-sig', newline=''); c, rest = t.split('___CONFIG_JSON___\r\n', 1)[1].split('___SHORTCUTS_JSON___\r\n', 1); d = p.parent; d.joinpath('config.json').write_bytes(c.encode('utf-8')); d.joinpath('shortcuts.json').write_bytes(rest.encode('utf-8'))"
+exit /b %errorlevel%
+:runpy3
+py -3 -c "import pathlib; p = pathlib.Path(r'%SRC%'); t = p.read_text(encoding='utf-8-sig', newline=''); c, rest = t.split('___CONFIG_JSON___\r\n', 1)[1].split('___SHORTCUTS_JSON___\r\n', 1); d = p.parent; d.joinpath('config.json').write_bytes(c.encode('utf-8')); d.joinpath('shortcuts.json').write_bytes(rest.encode('utf-8'))"
+exit /b %errorlevel%
+___CONFIG_JSON___
+{
+  "mode": "free",
+  "orientation": "vertical",
+  "side": "right",
+  "x": 206,
+  "y": 219,
+  "opacity": 0.72,
+  "toggle_hotkey": "ctrl+alt+shift+h",
+  "auto_hide_seconds": 0.0,
+  "dblclick_left_paste": true,
+  "dblclick_right_copy": true,
+  "hidden": false,
+  "disabled": [
+    "redo",
+    "save",
+    "find",
+    "replace",
+    "print",
+    "bold",
+    "italic",
+    "underline",
+    "delete-perm",
+    "properties",
+    "context",
+    "up",
+    "back",
+    "forward",
+    "refresh",
+    "new-folder",
+    "address",
+    "switch-back",
+    "cycle",
+    "maximize",
+    "restore",
+    "snap-left",
+    "snap-right",
+    "taskview",
+    "restore-all",
+    "close-doc",
+    "new-tab",
+    "reopen-tab",
+    "fullscreen",
+    "window-menu",
+    "help",
+    "lock",
+    "settings",
+    "search",
+    "quick",
+    "notify",
+    "widgets",
+    "emoji",
+    "snip",
+    "shot",
+    "shot-win",
+    "project",
+    "voice",
+    "zoom-in",
+    "zoom-out",
+    "taskmgr",
+    "lang",
+    "gamebar",
+    "record",
+    "desk-new",
+    "desk-close",
+    "desk-left",
+    "desk-right",
+    "url",
+    "tab-next",
+    "tab-prev",
+    "hard-refresh",
+    "page-in",
+    "page-out",
+    "page-100",
+    "play",
+    "next-track",
+    "prev-track",
+    "stop"
+  ],
+  "custom": []
+}
+___SHORTCUTS_JSON___
 {
   "version": 2,
   "active_group": 7,
