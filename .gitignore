@@ -4,6 +4,7 @@ error.log
 *.tmp
 *.broken.json
 config.json
+config.*.json
 shortcuts.json
 shortcuts.*.json
 shortcuts.before-groups.json

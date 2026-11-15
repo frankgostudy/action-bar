@@ -6,7 +6,7 @@
 
 ## 這次更新
 
-`config.json` 和 `shortcuts.json` 不放進版本庫。雙擊 `產生設定.bat` 會用這次附上的內容產生這兩個檔；程式之後改寫的位置、群組和啟動路徑留在這台電腦。
+`config.json` 和 `shortcuts.json` 不放進版本庫。沒有這兩個檔也能啟動，用的是程式內建的預設。要還原現在這一份（含開啟 CMD、格子和視窗位置），雙擊 `產生設定.bat`。它是這一天的快照，不會跟著以後的內建清單更新。檔案已經存在時會先問；選否不動任何東西，選是會先備份再覆蓋。
 
 可以新增「啟動程式」。一個按鈕仍是一筆記錄，裡面可以排一個或多個程式，按一下依序開啟。原來的快捷鍵不用改，也沒有被寫進新的類型。
 
@@ -43,7 +43,7 @@
 
 ### 資料
 
-`config.json` 放位置、透明度、顯示熱鍵、連點開關。`shortcuts.json` 是第 2 版：`version`、`next_group_id`、`next_shortcut_id`、`active_group`、`groups`、`shortcuts`、`pins`。群組是 `{ "id", "name" }`，編號只增不重用。快捷鍵是 `{ "id", "hotkey", "name", "groups" }`，`groups` 是群組編號陣列，同一筆可以屬於多個群組。沒有 `kind` 的就是快捷鍵。啟動程式是 `{ "id", "kind": "run", "name", "groups", "programs" }`，`programs` 裡每一項是 `{ "path", "args", "cwd", "admin" }`。`pins` 是六個快捷鍵編號，空格是 `0`，六格整份清單共用，不跟著群組換。作用中的群組由 `materialize()` 攤成 `self.shortcuts`。`config.json` 和 `shortcuts.json` 不放進版本庫，因為程式執行時會改寫它們。沒有這兩個檔時，雙擊 `產生設定.bat` 會產生目前這一份內容。`error.log`、`shortcuts.v1.bak.json` 也不要提交。
+`config.json` 放位置、透明度、顯示熱鍵、連點開關。`shortcuts.json` 是第 2 版：`version`、`next_group_id`、`next_shortcut_id`、`active_group`、`groups`、`shortcuts`、`pins`。群組是 `{ "id", "name" }`，編號只增不重用。快捷鍵是 `{ "id", "hotkey", "name", "groups" }`，`groups` 是群組編號陣列，同一筆可以屬於多個群組。沒有 `kind` 的就是快捷鍵。啟動程式是 `{ "id", "kind": "run", "name", "groups", "programs" }`，`programs` 裡每一項是 `{ "path", "args", "cwd", "admin" }`。`pins` 是六個快捷鍵編號，空格是 `0`，六格整份清單共用，不跟著群組換。作用中的群組由 `materialize()` 攤成 `self.shortcuts`。`config.json` 和 `shortcuts.json` 不放進版本庫，因為程式執行時會改寫它們。沒有這兩個檔也能啟動，用預設。要用現在這一份快照，雙擊 `產生設定.bat`。它不會跟著 `CATALOG` 更新。`error.log`、`shortcuts.v1.bak.json` 也不要提交。
 
 讀檔時若正規化和檔案不同，只改記憶體，不因為手改一個字就重寫檔案。沒有 `version`、但已經有 `groups` 和 `shortcuts`，仍當第 2 版，不會整份重轉。`version` 大於 2 則這次唯讀，不改檔案。寫檔只發生在轉換成功，以及使用者新增、修改、刪除、換群組、放格子的時候。轉換失敗則這次所有存檔都跳過，記 `error.log`，並提示一次；備份檔已經存在就保留最早那份。檔案讀失敗時保留畫面上的資料，等檔案再改過才重試，唯讀也會跟著恢復。
 
@@ -127,7 +127,7 @@
 
 ## 啟動
 
-雙擊 `啟動.bat`。程式會找 `pythonw`，找不到再試 `pyw -3`。還沒有設定檔時，先雙擊 `產生設定.bat`，它會寫出 `config.json` 和 `shortcuts.json`。再執行一次會用同一份內容蓋掉這台電腦後來改過的設定。
+雙擊 `啟動.bat`。程式會找 `pythonw`，找不到再試 `pyw -3`。沒有設定檔也能啟動，用預設；要用現在這一份就雙擊 `產生設定.bat`。那是某一天的快照，不會跟著程式裡的內建清單更新。檔案已存在時會先問，選否不動任何東西，選是會先備份成 `config.before-generate.json` 和 `shortcuts.before-generate.json` 再覆蓋。
 
 同一時間只能開一份。再啟動一次會出現「快捷列已經在執行。」然後結束。
 

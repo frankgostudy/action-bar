@@ -1,5 +1,14 @@
-﻿@echo off
+@echo off
 cd /d "%~dp0"
+set "ASK=0"
+if exist shortcuts.json set "ASK=1"
+if exist config.json set "ASK=1"
+if "%ASK%"=="1" (
+  choice /m "已有 config.json 或 shortcuts.json。先備份再覆蓋嗎"
+  if errorlevel 2 exit /b 0
+  if exist config.json copy /y config.json config.before-generate.json >nul
+  if exist shortcuts.json copy /y shortcuts.json shortcuts.before-generate.json >nul
+)
 set "SRC=%~f0"
 where python >nul 2>&1
 if %errorlevel%==0 goto :runpy
@@ -8,10 +17,10 @@ if %errorlevel%==0 goto :runpy3
 echo Python 3 was not found. Install it and tick "Add python.exe to PATH".
 exit /b 1
 :runpy
-python -c "import pathlib; p = pathlib.Path(r'%SRC%'); t = p.read_text(encoding='utf-8-sig', newline=''); c, rest = t.split('___CONFIG_JSON___\r\n', 1)[1].split('___SHORTCUTS_JSON___\r\n', 1); d = p.parent; d.joinpath('config.json').write_bytes(c.encode('utf-8')); d.joinpath('shortcuts.json').write_bytes(rest.encode('utf-8'))"
+python -c "import pathlib; p = pathlib.Path(r'%SRC%'); t = p.read_bytes().decode('utf-8-sig').replace('\r\n', '\n'); c, rest = t.split('___CONFIG_JSON___\n', 1)[1].split('___SHORTCUTS_JSON___\n', 1); d = p.parent; d.joinpath('config.json').write_bytes(c.encode('utf-8')); d.joinpath('shortcuts.json').write_bytes(rest.encode('utf-8'))"
 exit /b %errorlevel%
 :runpy3
-py -3 -c "import pathlib; p = pathlib.Path(r'%SRC%'); t = p.read_text(encoding='utf-8-sig', newline=''); c, rest = t.split('___CONFIG_JSON___\r\n', 1)[1].split('___SHORTCUTS_JSON___\r\n', 1); d = p.parent; d.joinpath('config.json').write_bytes(c.encode('utf-8')); d.joinpath('shortcuts.json').write_bytes(rest.encode('utf-8'))"
+py -3 -c "import pathlib; p = pathlib.Path(r'%SRC%'); t = p.read_bytes().decode('utf-8-sig').replace('\r\n', '\n'); c, rest = t.split('___CONFIG_JSON___\n', 1)[1].split('___SHORTCUTS_JSON___\n', 1); d = p.parent; d.joinpath('config.json').write_bytes(c.encode('utf-8')); d.joinpath('shortcuts.json').write_bytes(rest.encode('utf-8'))"
 exit /b %errorlevel%
 ___CONFIG_JSON___
 {
