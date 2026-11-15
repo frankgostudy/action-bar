@@ -1582,11 +1582,12 @@ def ensure_counters(library: dict) -> None:
 
 def repair_v2(data: dict) -> tuple[dict, list[str]]:
     problems: list[str] = []
-    retained_groups: list[dict] = []
+    retained_groups: list = []
     seen_names: set[str] = set()
     kept_groups: list[tuple[dict, str, int]] = []
     for item in data.get("groups") or []:
         if not isinstance(item, dict):
+            retained_groups.append(item)
             problems.append("略過無法讀取的群組。")
             continue
         name = str(item.get("name") or "").strip()
@@ -1605,7 +1606,8 @@ def repair_v2(data: dict) -> tuple[dict, list[str]]:
         else:
             pending_groups.append((item, name, gid, None))
     for item in retained_groups:
-        claimed_groups.add(_positive_id(item.get("id")))
+        if isinstance(item, dict):
+            claimed_groups.add(_positive_id(item.get("id")))
     claimed_groups.discard(0)
     next_group = max(claimed_groups, default=0) + 1
     remap: dict[int, int] = {}
@@ -1627,10 +1629,11 @@ def repair_v2(data: dict) -> tuple[dict, list[str]]:
         problems.append("沒有群組，已暫時使用「常用」。")
     valid_groups = {int(group["id"]) for group in groups}
 
-    retained: list[dict] = []
+    retained: list = []
     parsed_shortcuts: list[tuple[dict, str, int]] = []
     for item in data.get("shortcuts") or []:
         if not isinstance(item, dict):
+            retained.append(item)
             problems.append("略過無法讀取的快捷鍵。")
             continue
         try:
@@ -1649,7 +1652,8 @@ def repair_v2(data: dict) -> tuple[dict, list[str]]:
         else:
             pending_shortcuts.append((item, hotkey, None))
     for item in retained:
-        claimed.add(_positive_id(item.get("id")))
+        if isinstance(item, dict):
+            claimed.add(_positive_id(item.get("id")))
     claimed.discard(0)
     next_shortcut = max(claimed, default=0) + 1
     shortcuts: list[dict] = []
@@ -1672,9 +1676,10 @@ def repair_v2(data: dict) -> tuple[dict, list[str]]:
         shortcuts.append(row)
     valid_ids = {int(item["id"]) for item in shortcuts}
     for item in retained:
-        sid = _positive_id(item.get("id"))
-        if sid:
-            valid_ids.add(sid)
+        if isinstance(item, dict):
+            sid = _positive_id(item.get("id"))
+            if sid:
+                valid_ids.add(sid)
     active = _positive_id(data.get("active_group"))
     active = remap.get(active, active)
     if active not in valid_groups:
@@ -1796,12 +1801,8 @@ def save_library(library: dict) -> None:
         for key, value in library.items()
         if not str(key).startswith("_") and key not in ("retained", "retained_groups")
     }
-    payload["shortcuts"] = list(payload.get("shortcuts") or []) + [
-        item for item in library.get("retained") or [] if isinstance(item, dict)
-    ]
-    payload["groups"] = list(payload.get("groups") or []) + [
-        item for item in library.get("retained_groups") or [] if isinstance(item, dict)
-    ]
+    payload["shortcuts"] = list(payload.get("shortcuts") or []) + list(library.get("retained") or [])
+    payload["groups"] = list(payload.get("groups") or []) + list(library.get("retained_groups") or [])
     temporary = SHORTCUTS_PATH.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(SHORTCUTS_PATH)
@@ -1884,6 +1885,7 @@ class ActionBar:
         self.config = load_config()
         self.library, self._library_message = open_library()
         self._library_readonly = self._library_message is not None
+        self._readonly_noted = False
         self._by_id: dict[int, dict] = {}
         self._capturing = False
         self._reindex()
@@ -2825,8 +2827,17 @@ class ActionBar:
         except tk.TclError:
             pass
 
+    def _note_readonly(self) -> None:
+        if self._readonly_noted:
+            return
+        self._readonly_noted = True
+        messagebox.showwarning("快捷鍵", self._library_message or "目前不能修改快捷鍵。")
+
     def _place_pin(self, index: int, sid: int) -> None:
-        if self._editors or self._library_readonly:
+        if self._editors:
+            return
+        if self._library_readonly:
+            self._note_readonly()
             return
         valid = library_pin_ids(self.library)
         old = normalize_pin_ids(self.library.get("pins"), valid)
@@ -2838,7 +2849,10 @@ class ActionBar:
         self._refresh_pins(old, new)
 
     def clear_pin_cell(self, index: int) -> None:
-        if self._editors or self._library_readonly:
+        if self._editors:
+            return
+        if self._library_readonly:
+            self._note_readonly()
             return
         valid = library_pin_ids(self.library)
         old = normalize_pin_ids(self.library.get("pins"), valid)
@@ -3446,6 +3460,8 @@ class ActionBar:
             return
         self._library_readonly = message is not None
         self._library_message = message
+        if message is None:
+            self._readonly_noted = False
         self._shortcuts_mtime = mtime
         if message:
             return
@@ -3474,7 +3490,12 @@ class ActionBar:
         return group_name_of(self.library, int(self.library.get("active_group") or 0)) or "群組"
 
     def activate_group(self, gid: int) -> None:
-        if self._editors or self._library_readonly or int(gid) == int(self.library.get("active_group") or 0):
+        if self._editors:
+            return
+        if self._library_readonly:
+            self._note_readonly()
+            return
+        if int(gid) == int(self.library.get("active_group") or 0):
             return
         if group_by_id(self.library, int(gid)) is None:
             return
@@ -3625,21 +3646,23 @@ class ActionBar:
         filter_var = tk.StringVar(value="全部")
         filter_box = ttk.Combobox(top, textvariable=filter_var, state="readonly", width=16)
         filter_box.pack(side="left", padx=(6, 12))
-        tk.Label(top, text="勾了「顯示」才出現在目前的群組", bg="#f6f7f8", fg="#5f6368", font=FONT_HINT).pack(side="left")
         tk.Label(top, text="搜尋", bg="#f6f7f8", font=FONT_UI).pack(side="left")
         search_var = tk.StringVar()
-        tk.Entry(top, textvariable=search_var, font=FONT_UI, width=24).pack(side="left", padx=6)
+        search_entry = tk.Entry(top, textvariable=search_var, font=FONT_UI, width=24)
+        search_entry.pack(side="left", padx=6)
         manage_btn = tk.Button(top, text="群組管理…")
         manage_btn.pack(side="right")
+        hint_var = tk.StringVar()
+        tk.Label(outer, textvariable=hint_var, bg="#f6f7f8", fg="#5f6368", font=FONT_HINT, anchor="w").pack(fill="x", pady=(6, 0))
 
         tree_wrap = tk.Frame(outer, bg="#f6f7f8")
         tree_wrap.pack(fill="both", expand=True, pady=8)
         tree = ttk.Treeview(tree_wrap, columns=("shown", "hotkey", "name", "groups"), show="headings", height=12)
         tree.heading("shown", text="顯示")
+        tree.column("shown", width=120, anchor="center", stretch=False)
         tree.heading("hotkey", text="快捷鍵")
         tree.heading("name", text="名稱")
         tree.heading("groups", text="群組")
-        tree.column("shown", width=52, anchor="center", stretch=False)
         tree.column("hotkey", width=170, anchor="w")
         tree.column("name", width=140, anchor="w")
         tree.column("groups", width=240, anchor="w")
@@ -3679,12 +3702,13 @@ class ActionBar:
         tk.Label(key_row, textvariable=preview_var, bg="#f6f7f8", font=FONT_UI).pack(side="left", padx=8)
         name_var = tk.StringVar()
         tk.Label(form, text="名稱", bg="#f6f7f8", font=FONT_UI).pack(anchor="w")
-        tk.Entry(form, textvariable=name_var, font=FONT_UI).pack(fill="x", pady=(0, 6))
+        name_entry = tk.Entry(form, textvariable=name_var, font=FONT_UI)
+        name_entry.pack(fill="x", pady=(0, 6))
         group_host = tk.Frame(form, bg="#f6f7f8")
         group_host.pack(fill="x")
         group_vars: dict[int, tk.BooleanVar] = {}
         selected = {"id": None}
-        capturing = {"on": False, "bind": None}
+        capturing = {"on": False}
 
         def current_hotkey() -> str | None:
             key_name = key_by_label.get(key_var.get())
@@ -3718,6 +3742,13 @@ class ActionBar:
             filter_box["values"] = names
             if filter_var.get() not in names:
                 filter_var.set("全部")
+            refresh_shown_label()
+
+        def refresh_shown_label() -> None:
+            name = group_name_of(self.library, int(self.library.get("active_group") or 0)) or "群組"
+            hint_var.set(f"勾了「顯示」才出現在「{name}」。上方篩選只改清單，這一欄仍是「{name}」。")
+            tree.heading("shown", text=f"顯示·{name}")
+            tree.column("shown", width=max(120, 18 * len(name) + 52), anchor="center", stretch=False)
 
         def group_text(item: dict) -> str:
             labels = [group_name_of(self.library, int(gid)) for gid in item.get("groups") or []]
@@ -3759,17 +3790,33 @@ class ActionBar:
             if item is None or not gid:
                 return "break"
             groups = [int(value) for value in item.get("groups") or []]
-            if gid in groups:
+            removing = gid in groups
+            if removing:
                 groups = [value for value in groups if value != gid]
             else:
+                error = check_shortcut(
+                    self.library,
+                    str(item.get("hotkey") or ""),
+                    str(item.get("name") or "").strip(),
+                    [gid],
+                    ignore_id=int(iid),
+                )
+                if error:
+                    messagebox.showinfo("快捷鍵", error, parent=win)
+                    return "break"
                 groups.append(gid)
             item["groups"] = groups
             if selected["id"] == int(iid) and gid in group_vars:
                 group_vars[gid].set(gid in groups)
             self._store()
-            self.shortcuts = materialize(self.library)
-            self.relayout()
-            refresh()
+            chosen = filter_var.get()
+            active_name = group_name_of(self.library, gid)
+            hide = (removing and chosen == active_name) or (not removing and chosen == "未分組")
+            if hide:
+                tree.delete(iid)
+            else:
+                tree.set(iid, "shown", "☐" if removing else "☑")
+                tree.set(iid, "groups", group_text(item))
             return "break"
 
         def load_selected(_event=None) -> None:
@@ -3837,7 +3884,16 @@ class ActionBar:
             self._store()
             refresh()
             if creating:
+                new_id = None
+                rows = self.library.get("shortcuts") or []
+                if rows:
+                    new_id = rows[-1].get("id")
                 clear_entry()
+                if new_id is not None:
+                    try:
+                        tree.see(str(int(new_id)))
+                    except (tk.TclError, ValueError):
+                        pass
             elif kept is not None:
                 selected["id"] = kept
                 try:
@@ -3860,13 +3916,6 @@ class ActionBar:
         def stop_capture() -> None:
             capturing["on"] = False
             self._capturing = False
-            funcid = capturing["bind"]
-            capturing["bind"] = None
-            if funcid is not None:
-                try:
-                    win._unbind(("bind", "all", "<KeyPress>"), funcid)
-                except tk.TclError:
-                    pass
             try:
                 if capture_btn.winfo_exists():
                     capture_btn.configure(text="按下主鍵")
@@ -3905,35 +3954,34 @@ class ActionBar:
                 win.focus_force()
             except tk.TclError:
                 pass
-            capturing["bind"] = win.bind_all("<KeyPress>", on_key)
 
         def capture_inside() -> bool:
             try:
                 focus = win.focus_get()
-            except tk.TclError:
+            except (tk.TclError, KeyError):
                 return False
             if focus is None:
                 return False
             try:
                 return focus.winfo_toplevel() == win
-            except tk.TclError:
+            except (tk.TclError, KeyError):
                 return False
 
         def check_capture_focus() -> None:
-            if capturing["on"] and not capture_inside():
+            try:
+                inside = capture_inside()
+            except (tk.TclError, KeyError):
+                inside = False
+            if capturing["on"] and not inside:
                 stop_capture()
 
         def on_focus_out(_event) -> None:
             if capturing["on"] and win.winfo_exists():
                 win.after(20, check_capture_focus)
 
-        focus_bind = win.bind_all("<FocusOut>", on_focus_out, add="+")
-
         def close() -> None:
             try:
                 stop_capture()
-                if focus_bind is not None:
-                    win._unbind(("bind", "all", "<FocusOut>"), focus_bind)
             finally:
                 try:
                     if win.winfo_exists():
@@ -3955,6 +4003,10 @@ class ActionBar:
         tk.Button(buttons, text="刪除", command=remove_selected).pack(side="left")
         tk.Button(buttons, text="清空表單", command=clear_form).pack(side="left", padx=6)
         tk.Button(buttons, text="關閉", command=close).pack(side="right")
+        win.bind("<KeyPress>", on_key)
+        win.bind("<FocusOut>", on_focus_out)
+        for widget in (name_entry, search_entry, key_box, filter_box):
+            widget.bind("<KeyPress>", on_key)
         tree.bind("<Button-1>", toggle_shown)
         tree.bind("<<TreeviewSelect>>", load_selected)
         search_var.trace_add("write", lambda *_args: refresh())
@@ -4078,7 +4130,10 @@ class ActionBar:
         return result["value"]
 
     def remove_from_group(self, spec: dict) -> None:
-        if self._editors or self._library_readonly:
+        if self._editors:
+            return
+        if self._library_readonly:
+            self._note_readonly()
             return
         item = self._by_id.get(int(spec.get("id") or 0))
         gid = int(self.library.get("active_group") or 0)
