@@ -7,7 +7,8 @@
 按「選」管理快捷鍵。一般群組列出全部快捷鍵。同一組合在不同群組可以有不同名稱。
 頁籤「已勾選」只列出有打勾的鍵。可儲存或載入目前的勾選。勾選後立刻套用。
 按 — 縮到工作列旁的小圖示。按 × 結束程式。按齒輪可開關左鍵連點貼上、右鍵連點複製。
-快捷列最上方第一列是 PgUp、PgDn、Home、End、上、下，第二列是 Bksp、Del、Tab、Enter、左、右。滑鼠停在常用鍵上時，名稱以黑底白字顯示，直到滑鼠離開。
+快捷列最上方第一列是 PgUp、PgDn、Home、End、上、下，第二列是 Bksp、Del、Tab、Enter、左、右。
+其下以分隔線隔出六個格子，可從清單把快捷鍵拖進去。滑鼠停在常用鍵或格子上時，名稱以黑底白字顯示，直到滑鼠離開。
 
 快捷鍵寫法：ctrl+c、win+shift+s、ctrl+alt+shift+h。只含減號時也可寫 ctrl-c。
 """
@@ -692,6 +693,63 @@ def canonical_hotkey(text: str) -> str:
     return "+".join([*mods, key])
 
 
+PIN_COUNT = 6
+DRAG_START_PX = 6
+
+
+def normalize_pins(raw) -> list[str]:
+    cells = list(raw) if isinstance(raw, (list, tuple)) else []
+    cells = (cells + [""] * PIN_COUNT)[:PIN_COUNT]
+    pins: list[str] = []
+    for cell in cells:
+        text = str(cell or "").strip()
+        try:
+            pins.append(canonical_hotkey(text) if text else "")
+        except ValueError:
+            pins.append("")
+    seen: set[str] = set()
+    for index in range(PIN_COUNT - 1, -1, -1):
+        if not pins[index]:
+            continue
+        if pins[index] in seen:
+            pins[index] = ""
+        else:
+            seen.add(pins[index])
+    return pins
+
+
+def set_pin(pins: list[str], index: int, hotkey: str) -> list[str]:
+    if not 0 <= index < PIN_COUNT:
+        return list(pins)
+    result = ["" if cell == hotkey else cell for cell in pins]
+    result[index] = hotkey
+    return result
+
+
+def clear_pin(pins: list[str], index: int) -> list[str]:
+    result = list(pins)
+    if 0 <= index < PIN_COUNT:
+        result[index] = ""
+    return result
+
+
+def pin_at(x: int, y: int, rects: list, slop: int = 2) -> int:
+    for index, rect in enumerate(rects):
+        if rect is None:
+            continue
+        left, top, right, bottom = rect
+        if left - slop <= x < right + slop and top - slop <= y < bottom + slop:
+            return index
+    return -1
+
+
+def pin_face(label: str, main_key: str) -> str:
+    label = (label or "").strip()
+    if not label:
+        return main_key
+    return label if len(label) <= 3 else label[:2] + "…"
+
+
 def display_key(key: str) -> str:
     if key in DISPLAY_KEY:
         return DISPLAY_KEY[key]
@@ -1142,8 +1200,13 @@ def shortcuts_for(profile: dict) -> list[dict]:
     return [*items, *custom]
 
 
-def empty_profile(name: str, enabled: list[str] | None = None, names: dict | None = None) -> dict:
-    return {"name": name, "enabled": list(enabled or []), "names": dict(names or {})}
+def empty_profile(
+    name: str,
+    enabled: list[str] | None = None,
+    names: dict | None = None,
+    pins: list[str] | None = None,
+) -> dict:
+    return {"name": name, "enabled": list(enabled or []), "names": dict(names or {}), "pins": normalize_pins(pins)}
 
 
 def normalize_profile(item: dict, fallback: str) -> dict:
@@ -1168,7 +1231,7 @@ def normalize_profile(item: dict, fallback: str) -> dict:
         label = str(label or "").strip()
         if label:
             names[hotkey] = label
-    return {"name": name, "enabled": enabled, "names": names}
+    return {"name": name, "enabled": enabled, "names": names, "pins": normalize_pins(item.get("pins"))}
 
 
 def library_from_legacy(data) -> dict:
@@ -1341,6 +1404,9 @@ class ActionBar:
         self._drag_dx = 0
         self._drag_dy = 0
         self._dragging = False
+        self._key_drag = None
+        self._pin_frames: list = []
+        self._pin_parent = None
         self._toggle_requested = False
         self._tray_show = False
         self._tray_menu = False
@@ -1460,6 +1526,7 @@ class ActionBar:
             flags |= SWP_FRAMECHANGED
         user32.SetWindowPos(hwnd, topmost_handle(), 0, 0, 0, 0, flags)
         self._raise_tip()
+        self._raise_ghost()
 
     def _allow_activate(self, allow: bool) -> None:
         if not self.hwnd:
@@ -1480,6 +1547,7 @@ class ActionBar:
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         )
         self._raise_tip()
+        self._raise_ghost()
 
     def register_toggle(self) -> None:
         if not self.hwnd:
@@ -1519,6 +1587,7 @@ class ActionBar:
         return monitor_rect(cursor_x, cursor_y)
 
     def relayout(self) -> None:
+        self._cancel_key_drag()
         self._hide_tip()
         for child in self.tools.winfo_children():
             child.destroy()
@@ -1528,7 +1597,7 @@ class ActionBar:
         specs = visible_specs(self.config, self.shortcuts)
         vertical = self.config.get("orientation") == "vertical"
         mon = self._target_monitor()
-        cols = column_count(len(specs), vertical, mon, reserve=88) if specs else 1
+        cols = column_count(len(specs), vertical, mon, reserve=136) if specs else 1
         self._build_nav_pad().grid(row=0, column=0, columnspan=cols, padx=2, pady=(2, 4))
         if not specs:
             empty = tk.Label(self.body, text="沒有選擇快捷鍵", bg=BAR, fg=HINT, font=FONT, padx=16, pady=12)
@@ -1652,7 +1721,20 @@ class ActionBar:
                 self._make_icon_key(pad, hotkey, glyph, tip_name).grid(
                     row=row_index, column=4 + column, padx=2, pady=2
                 )
+        self._pin_rule(pad, 2, (4, 3))
+        self._pin_parent = pad
+        self._pin_frames = []
+        for index, hotkey in enumerate(normalize_pins(self._active_profile().get("pins"))):
+            cell = self._make_pin_key(pad, index, hotkey)
+            cell.grid(row=3, column=index, padx=2, pady=2)
+            self._pin_frames.append(cell)
+        self._pin_rule(pad, 4, (3, 0))
         return pad
+
+    def _pin_rule(self, pad, row: int, pady: tuple[int, int]) -> None:
+        rule = tk.Frame(pad, bg="#4a4e57", width=1, height=1, highlightthickness=0, bd=0)
+        rule.grid_propagate(False)
+        rule.grid(row=row, column=0, columnspan=6, sticky="ew", pady=pady)
 
     def _make_icon_key(self, parent, hotkey: str, glyph: str, tip_name: str) -> tk.Frame:
         spec = {"id": "nav-" + hotkey, "group": "常用鍵", "label": glyph, "hotkey": hotkey}
@@ -1729,7 +1811,8 @@ class ActionBar:
         frame._busy = False
         frame._gen = 0
         for widget in (frame, title, subtitle):
-            widget.bind("<ButtonPress-1>", lambda _event, box=frame: self._press_key(box))
+            widget.bind("<ButtonPress-1>", lambda event, box=frame, item=spec: self._press_list_key(event, box, item))
+            widget.bind("<B1-Motion>", self._key_drag_move)
             widget.bind("<ButtonRelease-1>", lambda event, box=frame, item=spec: self._release_key(event, box, item))
             widget.bind("<Enter>", lambda _event, box=frame: self._hover_key(box, True))
             widget.bind("<Leave>", lambda _event, box=frame: self._hover_key(box, False))
@@ -1760,6 +1843,9 @@ class ActionBar:
         return left <= pointer_x < left + frame.winfo_width() and top <= pointer_y < top + frame.winfo_height()
 
     def _hover_key(self, frame, entering: bool) -> None:
+        drag = self._key_drag
+        if drag is not None and drag["active"]:
+            return
         if not frame.winfo_exists() or frame._busy:
             return
         if not entering:
@@ -1832,6 +1918,22 @@ class ActionBar:
             if not tip.winfo_exists():
                 return
             hwnd = native_hwnd(tip.winfo_id())
+        except tk.TclError:
+            return
+        if hwnd:
+            user32.SetWindowPos(hwnd, topmost_handle(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+    def _raise_ghost(self) -> None:
+        drag = self._key_drag
+        if drag is None or not drag.get("active"):
+            return
+        ghost = drag.get("ghost")
+        if ghost is None:
+            return
+        try:
+            if not ghost.winfo_exists():
+                return
+            hwnd = native_hwnd(ghost.winfo_id())
         except tk.TclError:
             return
         if hwnd:
@@ -2029,6 +2131,260 @@ class ActionBar:
         self._cancel_tip_watch()
         self._close_tip_window()
 
+    def _pin_text(self, hotkey: str) -> tuple[str, str]:
+        try:
+            _mods, key = parse_hotkey(hotkey)
+        except ValueError:
+            return "", ""
+        label = next(
+            (str(item.get("label") or "").strip() for item in self.shortcuts if item.get("hotkey") == hotkey),
+            "",
+        )
+        try:
+            full = format_hotkey(hotkey)
+        except ValueError:
+            full = hotkey
+        return pin_face(label, display_key(key)), (f"{label} · {full}" if label else full)
+
+    def _make_pin_key(self, parent, index: int, hotkey: str):
+        face, tip = self._pin_text(hotkey) if hotkey else ("", "")
+        filled = bool(hotkey)
+        bg, edge = ("#dbe6f7", "#8aa0c8") if filled else ("#24262b", "#5a5f6a")
+        frame = tk.Frame(
+            parent,
+            bg=bg,
+            width=48,
+            height=30,
+            cursor="hand2" if filled else "arrow",
+            takefocus=False,
+            highlightthickness=1,
+            highlightbackground=edge,
+        )
+        frame.pack_propagate(False)
+        frame.grid_propagate(False)
+        title = tk.Label(
+            frame,
+            text=face,
+            bg=bg,
+            fg="#1b1c20",
+            takefocus=False,
+            font=("Microsoft JhengHei UI", 8, "bold"),
+        )
+        title.place(relx=0.5, rely=0.5, anchor="center")
+        frame._bg = bg
+        frame._fg = "#1b1c20"
+        frame._hover = "#174ea6"
+        frame._edge = edge
+        frame._tip_name = tip
+        frame._label = title
+        frame._hint = None
+        frame._hint_text = ""
+        frame._hint_fg = "#ffffff"
+        frame._pressed = False
+        frame._busy = False
+        frame._gen = 0
+        spec = {"id": f"pin-{index}", "group": "格子", "label": face, "hotkey": hotkey}
+        for widget in (frame, title):
+            widget.bind("<Button-3>", lambda event, i=index: self._open_pin_menu(event, i))
+            if filled:
+                widget.bind("<ButtonPress-1>", lambda _event, box=frame: self._press_key(box))
+                widget.bind("<ButtonRelease-1>", lambda event, box=frame, item=spec: self._release_key(event, box, item))
+                widget.bind("<Enter>", lambda _event, box=frame: self._hover_key(box, True))
+                widget.bind("<Leave>", lambda _event, box=frame: self._hover_key(box, False))
+        return frame
+
+    def _press_list_key(self, event, frame, spec) -> None:
+        self._press_key(frame)
+        if self._editors or frame._busy or self._key_drag is not None:
+            return
+        self._key_drag = {
+            "frame": frame,
+            "spec": spec,
+            "x0": event.x_root,
+            "y0": event.y_root,
+            "active": False,
+            "ghost": None,
+            "target": -1,
+        }
+
+    def _key_drag_move(self, event) -> None:
+        drag = self._key_drag
+        if drag is None or self._editors:
+            return
+        if not drag["active"]:
+            if abs(event.x_root - drag["x0"]) < DRAG_START_PX and abs(event.y_root - drag["y0"]) < DRAG_START_PX:
+                return
+            drag["active"] = True
+            self._dragging = True
+            self._cancel_hide()
+            self._hide_tip()
+            drag["frame"]._pressed = False
+            self._paint_key_normal(drag["frame"])
+            spec = drag["spec"]
+            drag["ghost"] = self._make_ghost(spec["label"] or format_hotkey(spec["hotkey"]), event.x_root, event.y_root)
+        self._move_ghost(drag["ghost"], event.x_root, event.y_root)
+        target = pin_at(event.x_root, event.y_root, self._pin_rects())
+        if target != drag["target"]:
+            self._mark_pin(drag["target"], False)
+            self._mark_pin(target, True)
+            drag["target"] = target
+        self._raise_ghost()
+
+    def _finish_drag(self, drag, event) -> None:
+        self._end_drag_ui(drag)
+        index = pin_at(event.x_root, event.y_root, self._pin_rects())
+        if index >= 0:
+            self._place_pin(index, drag["spec"]["hotkey"])
+
+    def _end_drag_ui(self, drag) -> None:
+        self._dragging = False
+        self._mark_pin(drag["target"], False)
+        ghost = drag.get("ghost")
+        drag["ghost"] = None
+        if ghost is not None:
+            try:
+                ghost.destroy()
+            except tk.TclError:
+                pass
+
+    def _cancel_key_drag(self) -> None:
+        drag = self._key_drag
+        self._key_drag = None
+        if drag is not None and drag["active"]:
+            self._end_drag_ui(drag)
+
+    def _make_ghost(self, text: str, x: int, y: int):
+        ghost = tk.Toplevel(self.root)
+        ghost.overrideredirect(True)
+        ghost.withdraw()
+        ghost.attributes("-topmost", True)
+        ghost.configure(bg="#fbbc04")
+        tk.Label(
+            ghost,
+            text=text,
+            bg="#fbbc04",
+            fg="#1b1c20",
+            padx=8,
+            pady=3,
+            font=("Microsoft JhengHei UI", 9, "bold"),
+        ).pack()
+        ghost.update_idletasks()
+        try:
+            ghost.attributes("-alpha", 1.0)
+        except tk.TclError:
+            pass
+        self._move_ghost(ghost, x, y)
+        hwnd = native_hwnd(ghost.winfo_id())
+        if hwnd:
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = (style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) & ~WS_EX_TRANSPARENT
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            user32.SetWindowPos(
+                hwnd,
+                topmost_handle(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        ghost.deiconify()
+        try:
+            ghost.attributes("-alpha", 1.0)
+        except tk.TclError:
+            pass
+        return ghost
+
+    def _move_ghost(self, ghost, x: int, y: int) -> None:
+        try:
+            if ghost is None or not ghost.winfo_exists():
+                return
+            width, height = ghost.winfo_reqwidth(), ghost.winfo_reqheight()
+        except tk.TclError:
+            return
+        mon = monitor_rect(x, y)
+        origin_x = max(mon[0], min(x + 14, mon[2] - width))
+        origin_y = max(mon[1], min(y + 14, mon[3] - height))
+        ghost.geometry(f"+{int(origin_x)}+{int(origin_y)}")
+
+    def _pin_rects(self) -> list:
+        rects = []
+        for frame in self._pin_frames:
+            try:
+                left, top = frame.winfo_rootx(), frame.winfo_rooty()
+                rects.append((left, top, left + frame.winfo_width(), top + frame.winfo_height()))
+            except tk.TclError:
+                rects.append(None)
+        return rects
+
+    def _mark_pin(self, index: int, on: bool) -> None:
+        if not 0 <= index < len(self._pin_frames):
+            return
+        frame = self._pin_frames[index]
+        try:
+            if not frame.winfo_exists():
+                return
+            frame.configure(highlightbackground="#fbbc04" if on else frame._edge)
+        except tk.TclError:
+            pass
+
+    def _place_pin(self, index: int, hotkey: str) -> None:
+        try:
+            hotkey = canonical_hotkey(hotkey)
+        except ValueError:
+            return
+        profile = self._active_profile()
+        old = normalize_pins(profile.get("pins"))
+        new = set_pin(old, index, hotkey)
+        if new == old:
+            return
+        profile["pins"] = new
+        self._save_shortcuts()
+        self._refresh_pins(old, new)
+
+    def clear_pin_cell(self, index: int) -> None:
+        profile = self._active_profile()
+        old = normalize_pins(profile.get("pins"))
+        new = clear_pin(old, index)
+        if new == old:
+            return
+        profile["pins"] = new
+        self._save_shortcuts()
+        self._refresh_pins(old, new)
+
+    def _refresh_pins(self, old: list, new: list) -> None:
+        self._hide_tip()
+        parent = self._pin_parent
+        if parent is None:
+            return
+        try:
+            if not parent.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        for index, frame in enumerate(self._pin_frames):
+            if old[index] == new[index]:
+                continue
+            try:
+                frame.destroy()
+            except tk.TclError:
+                pass
+            fresh = self._make_pin_key(parent, index, new[index])
+            fresh.grid(row=3, column=index, padx=2, pady=2)
+            self._pin_frames[index] = fresh
+        self.root.update_idletasks()
+        for frame in self._pin_frames:
+            if getattr(frame, "_tip_name", "") and self._pointer_inside(frame):
+                self._hover_key(frame, True)
+                break
+
+    def _open_pin_menu(self, event, index: int) -> None:
+        rows = self._bar_rows()
+        pins = normalize_pins(self._active_profile().get("pins"))
+        if index < len(pins) and pins[index]:
+            rows = [("清空這格", lambda i=index: self.clear_pin_cell(i)), None, *rows]
+        self._open_menu(event.x_root, event.y_root, rows)
+
     def _press_key(self, frame) -> None:
         frame._pressed = True
         if not getattr(frame, "_tip_name", ""):
@@ -2036,6 +2392,12 @@ class ActionBar:
         self._paint_key(frame, PRESS, "#ffffff", "#ffffff")
 
     def _release_key(self, event, frame, spec: dict) -> None:
+        drag = self._key_drag
+        if drag is not None and drag["frame"] is frame:
+            self._key_drag = None
+            if drag["active"]:
+                self._finish_drag(drag, event)
+                return
         pressed = frame._pressed
         frame._pressed = False
         if pressed and inside(frame, event):
@@ -2142,6 +2504,7 @@ class ActionBar:
         self.hide()
 
     def hide(self) -> None:
+        self._cancel_key_drag()
         self._cancel_hide()
         self._close_menu()
         self.config["hidden"] = True
@@ -2518,6 +2881,9 @@ class ActionBar:
                 self._open_tray_menu()
             elif self._tray_menu:
                 self._tray_menu = False
+            drag = self._key_drag
+            if drag is not None and not key_is_down(0x01):
+                self._cancel_key_drag()
             self._watch_foreground()
             self._watch_config()
             self._watch_shortcuts()
@@ -2535,8 +2901,11 @@ class ActionBar:
             if self.hwnd and self._editors <= 0:
                 self._apply_exstyle(self.hwnd)
             self._raise_tip()
+            self._raise_ghost()
             if self._tip is not None:
                 self.root.after(1, self._raise_tip)
+            if self._key_drag is not None and self._key_drag.get("ghost") is not None:
+                self.root.after(1, self._raise_ghost)
         except Exception:
             log_exc()
         if self._alive:
@@ -2885,7 +3254,14 @@ class ActionBar:
                 return
             flush()
             source = next((item for item in self.library["profiles"] if item.get("name") == "一般"), empty_profile("一般"))
-            self.library["profiles"].append(empty_profile(name, list(source.get("enabled") or []), dict(source.get("names") or {})))
+            self.library["profiles"].append(
+                empty_profile(
+                    name,
+                    list(source.get("enabled") or []),
+                    dict(source.get("names") or {}),
+                    list(source.get("pins") or []),
+                )
+            )
             self.library["active"] = name
             self.shortcuts = materialize(self.library)
             save_library(self.library)
@@ -3286,6 +3662,7 @@ class ActionBar:
             self.root.withdraw()
 
     def quit(self) -> None:
+        self._cancel_key_drag()
         self._alive = False
         self._cancel_hide()
         self._remove_tray()
