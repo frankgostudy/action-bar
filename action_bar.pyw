@@ -868,6 +868,54 @@ def monitor_rect(x: int, y: int) -> tuple[int, int, int, int]:
     return 0, 0, int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
 
 
+class SHELLEXECUTEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("fMask", wintypes.ULONG),
+        ("hwnd", wintypes.HWND),
+        ("lpVerb", wintypes.LPCWSTR),
+        ("lpFile", wintypes.LPCWSTR),
+        ("lpParameters", wintypes.LPCWSTR),
+        ("lpDirectory", wintypes.LPCWSTR),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", ctypes.c_void_p),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", wintypes.LPCWSTR),
+        ("hkeyClass", wintypes.HKEY),
+        ("dwHotKey", wintypes.DWORD),
+        ("hMonitor", wintypes.HANDLE),
+        ("hProcess", wintypes.HANDLE),
+    ]
+
+
+shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+shell32.ShellExecuteExW.restype = wintypes.BOOL
+SEE_MASK_FLAG_NO_UI = 0x00000400
+SW_SHOWNORMAL = 1
+ERROR_CANCELLED = 1223
+
+
+def launch_program(path: str, args: str, cwd: str, admin: bool) -> int:
+    info = SHELLEXECUTEINFOW()
+    info.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+    info.fMask = SEE_MASK_FLAG_NO_UI
+    info.hwnd = None
+    info.lpVerb = "runas" if admin else "open"
+    info.lpFile = path
+    info.lpParameters = args if str(args or "") != "" else None
+    info.lpDirectory = str(cwd or "").strip() or os.path.expanduser("~")
+    info.nShow = SW_SHOWNORMAL
+    if shell32.ShellExecuteExW(ctypes.byref(info)):
+        return 33
+    code = int(ctypes.get_last_error() or 0)
+    inst = int(info.hInstApp or 0)
+    if code == ERROR_CANCELLED or inst == ERROR_CANCELLED:
+        return ERROR_CANCELLED
+    if 0 < inst <= 32:
+        return inst
+    return code or inst or 0
+
+
 def column_count(count: int, vertical: bool, mon: tuple[int, int, int, int], reserve: int = 0) -> int:
     if count <= 0:
         return 1
@@ -973,23 +1021,32 @@ def focus_window(hwnd: int) -> None:
 
 def button_label(item: dict) -> str:
     label = str(item.get("label") or "").strip()
-    return label or format_hotkey(item["hotkey"])
+    if label:
+        return label
+    if item.get("kind") == "run":
+        return run_summary(item.get("programs") or [])
+    return format_hotkey(item["hotkey"])
 
 
 def visible_specs(config: dict, shortcuts: list[dict] | None = None) -> list[dict]:
     disabled = set(config.get("disabled") or [])
     source = shortcuts if shortcuts is not None else []
-    return [
-        {
+    rows: list[dict] = []
+    for item in source:
+        if not item.get("enabled", item["id"] not in disabled):
+            continue
+        row = {
             "id": item["id"],
             "group": item["group"],
             "label": button_label(item),
-            "hotkey": item["hotkey"],
+            "hotkey": item.get("hotkey") or "",
             "custom": not item.get("builtin"),
         }
-        for item in source
-        if item.get("enabled", item["id"] not in disabled)
-    ]
+        if item.get("kind") == "run":
+            row["kind"] = "run"
+            row["programs"] = item.get("programs") or []
+        rows.append(row)
+    return rows
 
 
 def normalize_config(data: dict) -> dict:
@@ -1413,12 +1470,19 @@ def members_of(library: dict, group_id: int) -> list[dict]:
     for item in library.get("shortcuts") or []:
         if group_id not in (item.get("groups") or []):
             continue
+        run = is_run(item)
+        label = str(item.get("name") or "").strip()
+        programs = item.get("programs") or [] if run else []
+        if run and not label:
+            label = run_summary(programs)
         rows.append(
             {
                 "id": item["id"],
                 "group": name,
-                "label": str(item.get("name") or "").strip(),
-                "hotkey": item["hotkey"],
+                "label": label,
+                "hotkey": "" if run else item.get("hotkey") or "",
+                "kind": "run" if run else "keys",
+                "programs": programs,
                 "builtin": False,
                 "enabled": True,
             }
@@ -1434,16 +1498,102 @@ def visible_pairs(library: dict, group_id: int) -> list[tuple[str, str]]:
     return [(item["hotkey"], item["label"]) for item in members_of(library, group_id)]
 
 
+def is_run(item: dict) -> bool:
+    return isinstance(item, dict) and str(item.get("kind") or "").strip() == "run"
+
+
+def normalize_programs(raw) -> list[dict] | None:
+    if not isinstance(raw, list):
+        return None
+    cleaned: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return None
+        path = str(entry.get("path") or "").strip()
+        if not path:
+            continue
+        row = dict(entry)
+        row["path"] = path
+        row["args"] = str(entry.get("args") or "")
+        row["cwd"] = str(entry.get("cwd") or "").strip()
+        row["admin"] = entry.get("admin") is True or entry.get("admin") == 1
+        cleaned.append(row)
+    return cleaned
+
+
+def program_leaf(path: str) -> str:
+    name = Path(str(path or "")).name
+    return name or str(path or "")
+
+
+def run_summary(programs: list) -> str:
+    usable = [item for item in programs or [] if isinstance(item, dict) and str(item.get("path") or "").strip()]
+    if not usable:
+        return "啟動"
+    first = program_leaf(str(usable[0].get("path") or ""))
+    if len(usable) == 1:
+        return first
+    return f"{first} 等 {len(usable)} 個"
+
+
+def run_tip(name: str, programs: list) -> str:
+    parts: list[str] = []
+    for item in programs or []:
+        if not isinstance(item, dict):
+            continue
+        bit = program_leaf(str(item.get("path") or ""))
+        args = str(item.get("args") or "").strip()
+        cwd = str(item.get("cwd") or "").strip()
+        if args:
+            bit = f"{bit} {args}"
+        if cwd:
+            bit = f"{bit} @ {cwd}"
+        if item.get("admin") is True or item.get("admin") == 1:
+            bit = f"{bit}（系統管理員）"
+        parts.append(bit)
+    body = "、".join(parts) or "啟動"
+    label = str(name or "").strip()
+    return f"{label} · {body}" if label else body
+
+
+def program_signature(programs: list[dict]) -> tuple:
+    return tuple(
+        (
+            item["path"],
+            item.get("args") or "",
+            item.get("cwd") or "",
+            bool(item.get("admin")),
+        )
+        for item in programs
+    )
+
+
+def check_run(library: dict, programs, ignore_id: int | None = None) -> str | None:
+    cleaned = normalize_programs(programs)
+    if not cleaned:
+        return "請至少填一個程式路徑。"
+    signature = program_signature(cleaned)
+    for item in library.get("shortcuts") or []:
+        if not is_run(item):
+            continue
+        if ignore_id is not None and item.get("id") == ignore_id:
+            continue
+        other = normalize_programs(item.get("programs"))
+        if other and program_signature(other) == signature:
+            return "已有這一筆，請在它的群組欄勾選要加入的群組。"
+    return None
+
+
 def check_shortcut(library: dict, hotkey: str, name: str, group_ids: list[int], ignore_id: int | None = None) -> str | None:
     name = str(name or "").strip()
     for item in library.get("shortcuts") or []:
-        if ignore_id is not None and item.get("id") == ignore_id:
+        if is_run(item) or (ignore_id is not None and item.get("id") == ignore_id):
             continue
         if item.get("hotkey") == hotkey and str(item.get("name") or "").strip() == name:
             return "已有這一筆，請在它的群組欄勾選要加入的群組。"
     for gid in group_ids:
         for item in library.get("shortcuts") or []:
-            if ignore_id is not None and item.get("id") == ignore_id:
+            if is_run(item) or (ignore_id is not None and item.get("id") == ignore_id):
                 continue
             if item.get("hotkey") == hotkey and gid in (item.get("groups") or []):
                 label = str(item.get("name") or "").strip() or format_hotkey(hotkey)
@@ -1474,9 +1624,46 @@ def update_shortcut(library: dict, sid: int, hotkey: str, name: str, group_ids: 
     error = check_shortcut(library, hotkey, name, groups, ignore_id=sid)
     if error:
         return error
+    item.pop("kind", None)
+    item.pop("programs", None)
     item["hotkey"] = hotkey
     item["name"] = name
     item["groups"] = groups
+    return None
+
+
+def add_run(library: dict, name: str, group_ids: list[int], programs) -> str | None:
+    cleaned = normalize_programs(programs)
+    error = check_run(library, cleaned)
+    if error:
+        return error
+    sid = int(library.get("next_shortcut_id") or 1)
+    library["next_shortcut_id"] = sid + 1
+    library.setdefault("shortcuts", []).append(
+        {
+            "id": sid,
+            "kind": "run",
+            "name": str(name or "").strip(),
+            "groups": [int(gid) for gid in group_ids],
+            "programs": cleaned,
+        }
+    )
+    return None
+
+
+def update_run(library: dict, sid: int, name: str, group_ids: list[int], programs) -> str | None:
+    item = shortcut_by_id(library, sid)
+    if item is None:
+        return "找不到這一筆。"
+    cleaned = normalize_programs(programs)
+    error = check_run(library, cleaned, ignore_id=sid)
+    if error:
+        return error
+    item.pop("hotkey", None)
+    item["kind"] = "run"
+    item["name"] = str(name or "").strip()
+    item["groups"] = [int(gid) for gid in group_ids]
+    item["programs"] = cleaned
     return None
 
 
@@ -1630,11 +1817,24 @@ def repair_v2(data: dict) -> tuple[dict, list[str]]:
     valid_groups = {int(group["id"]) for group in groups}
 
     retained: list = []
-    parsed_shortcuts: list[tuple[dict, str, int]] = []
+    parsed_shortcuts: list[tuple] = []
     for item in data.get("shortcuts") or []:
         if not isinstance(item, dict):
             retained.append(item)
             problems.append("略過無法讀取的快捷鍵。")
+            continue
+        kind = str(item.get("kind") or "").strip()
+        if kind == "run":
+            programs = normalize_programs(item.get("programs"))
+            if not programs:
+                retained.append(dict(item))
+                problems.append(f"略過沒有程式的啟動項目：{item.get('name') or item.get('id')}")
+                continue
+            parsed_shortcuts.append((item, "run", programs, _positive_id(item.get("id"))))
+            continue
+        if kind and kind != "keys":
+            retained.append(dict(item))
+            problems.append(f"略過未知類型：{kind}")
             continue
         try:
             hotkey = canonical_hotkey(str(item.get("hotkey") or ""))
@@ -1642,26 +1842,27 @@ def repair_v2(data: dict) -> tuple[dict, list[str]]:
             retained.append(dict(item))
             problems.append(f"略過無效組合：{item.get('hotkey')}")
             continue
-        parsed_shortcuts.append((item, hotkey, _positive_id(item.get("id"))))
+        parsed_shortcuts.append((item, "keys", hotkey, _positive_id(item.get("id"))))
     claimed: set[int] = set()
-    pending_shortcuts: list[tuple[dict, str, int | None]] = []
-    for item, hotkey, sid in parsed_shortcuts:
+    pending_shortcuts: list[tuple] = []
+    for item, kind, payload, sid in parsed_shortcuts:
         if sid and sid not in claimed:
             claimed.add(sid)
-            pending_shortcuts.append((item, hotkey, sid))
+            pending_shortcuts.append((item, kind, payload, sid))
         else:
-            pending_shortcuts.append((item, hotkey, None))
+            pending_shortcuts.append((item, kind, payload, None))
     for item in retained:
         if isinstance(item, dict):
             claimed.add(_positive_id(item.get("id")))
     claimed.discard(0)
     next_shortcut = max(claimed, default=0) + 1
     shortcuts: list[dict] = []
-    for item, hotkey, assigned in pending_shortcuts:
+    for item, kind, payload, assigned in pending_shortcuts:
         if assigned is None:
             assigned = next_shortcut
             next_shortcut += 1
-            problems.append(f"快捷鍵 {hotkey} 的編號已重編為 {assigned}。")
+            label = payload if kind == "keys" else (str(item.get("name") or "").strip() or run_summary(payload))
+            problems.append(f"快捷鍵 {label} 的編號已重編為 {assigned}。")
         linked: list[int] = []
         for value in item.get("groups") or []:
             gid = _positive_id(value)
@@ -1670,9 +1871,14 @@ def repair_v2(data: dict) -> tuple[dict, list[str]]:
                 linked.append(gid)
         row = dict(item)
         row["id"] = assigned
-        row["hotkey"] = hotkey
         row["name"] = str(item.get("name") or "").strip()
         row["groups"] = linked
+        if kind == "run":
+            row["kind"] = "run"
+            row["programs"] = payload
+            row.pop("hotkey", None)
+        else:
+            row["hotkey"] = payload
         shortcuts.append(row)
     valid_ids = {int(item["id"]) for item in shortcuts}
     for item in retained:
@@ -2271,12 +2477,19 @@ class ActionBar:
 
     def _make_key(self, spec: dict, vertical: bool) -> tk.Frame:
         bg = BTN
-        try:
-            hint = format_hotkey(spec["hotkey"])
+        tip_name = ""
+        if spec.get("kind") == "run":
+            programs = spec.get("programs") or []
+            hint = run_summary(programs)
             hint_fg = HINT
-        except ValueError:
-            hint = str(spec["hotkey"])
-            hint_fg = "#f28b82"
+            tip_name = run_tip(spec.get("label") or "", programs)
+        else:
+            try:
+                hint = format_hotkey(spec["hotkey"])
+                hint_fg = HINT
+            except ValueError:
+                hint = str(spec["hotkey"])
+                hint_fg = "#f28b82"
         frame = tk.Frame(
             self.body,
             bg=bg,
@@ -2305,6 +2518,8 @@ class ActionBar:
         frame._pressed = False
         frame._busy = False
         frame._gen = 0
+        if tip_name:
+            frame._tip_name = tip_name
         for widget in (frame, title, subtitle):
             widget.bind("<ButtonPress-1>", lambda event, box=frame, item=spec: self._press_list_key(event, box, item))
             widget.bind("<B1-Motion>", self._key_drag_move)
@@ -2630,10 +2845,16 @@ class ActionBar:
         item = self._by_id.get(int(sid or 0))
         if not item:
             return "", "", ""
+        if is_run(item):
+            programs = normalize_programs(item.get("programs")) or []
+            label = str(item.get("name") or "").strip()
+            summary = run_summary(programs)
+            face_key = program_leaf(programs[0]["path"])[:3] if programs else "啟動"
+            return pin_face(label, face_key), run_tip(label, programs), summary
         try:
             _mods, key = parse_hotkey(item["hotkey"])
             full = format_hotkey(item["hotkey"])
-        except ValueError:
+        except (ValueError, KeyError):
             return "", "", ""
         label = str(item.get("name") or "").strip()
         tip = f"{label} · {full}" if label else full
@@ -2676,7 +2897,16 @@ class ActionBar:
         frame._pressed = False
         frame._busy = False
         frame._gen = 0
-        spec = {"id": sid, "group": "格子", "label": face, "hotkey": hotkey}
+        source = self._by_id.get(int(sid or 0)) or {}
+        spec = {
+            "id": sid,
+            "group": "格子",
+            "label": face,
+            "hotkey": "" if is_run(source) else hotkey,
+            "kind": "run" if is_run(source) else "keys",
+            "programs": source.get("programs") or [],
+        }
+        filled = bool(sid and (is_run(source) or hotkey))
         for widget in (frame, title):
             widget.bind("<Button-3>", lambda event, i=index: self._open_pin_menu(event, i))
             if filled:
@@ -2974,7 +3204,47 @@ class ActionBar:
             return "elevated"
         return "ok"
 
+    def _launch_programs(self, spec: dict, frame) -> None:
+        programs = normalize_programs(spec.get("programs"))
+        if not programs:
+            try:
+                item = self._by_id.get(int(spec.get("id") or 0))
+            except (TypeError, ValueError):
+                item = None
+            programs = normalize_programs(item.get("programs")) if item else None
+        if not programs:
+            self._flash(frame, False, "沒有程式")
+            return
+        failed: list[str] = []
+        cancelled: list[str] = []
+        for program in programs:
+            code = launch_program(
+                program["path"],
+                str(program.get("args") or ""),
+                str(program.get("cwd") or ""),
+                bool(program.get("admin")),
+            )
+            if code > 32:
+                continue
+            leaf = program_leaf(program["path"])
+            if code == ERROR_CANCELLED:
+                cancelled.append(leaf)
+            else:
+                failed.append(leaf)
+        if not failed and not cancelled:
+            self._flash(frame, True, None)
+            return
+        if cancelled and not failed:
+            text = "已取消" if len(programs) == 1 else f"{cancelled[0]} 已取消"
+        else:
+            name = (failed or cancelled)[0]
+            text = "啟動失敗" if len(programs) == 1 else f"{name} 沒開成"
+        self._flash(frame, False, text)
+
     def _activate(self, spec: dict, frame) -> None:
+        if spec.get("kind") == "run":
+            self._launch_programs(spec, frame)
+            return
         try:
             mods, key = parse_hotkey(spec["hotkey"])
         except ValueError:
@@ -3635,7 +3905,7 @@ class ActionBar:
         self._begin_modal()
         win = tk.Toplevel(self.root)
         win.title("快捷鍵")
-        win.geometry("760x640")
+        win.geometry("920x760")
         win.attributes("-topmost", True)
         win.configure(bg="#f6f7f8")
         outer = tk.Frame(win, bg="#f6f7f8", padx=12, pady=12)
@@ -3657,7 +3927,7 @@ class ActionBar:
 
         tree_wrap = tk.Frame(outer, bg="#f6f7f8")
         tree_wrap.pack(fill="both", expand=True, pady=8)
-        tree = ttk.Treeview(tree_wrap, columns=("shown", "hotkey", "name", "groups"), show="headings", height=12)
+        tree = ttk.Treeview(tree_wrap, columns=("shown", "hotkey", "name", "groups"), show="headings", height=8)
         tree.heading("shown", text="顯示")
         tree.column("shown", width=120, anchor="center", stretch=False)
         tree.heading("hotkey", text="快捷鍵")
@@ -3673,15 +3943,32 @@ class ActionBar:
 
         form = tk.Frame(outer, bg="#f6f7f8")
         form.pack(fill="x")
+        mode_var = tk.StringVar(value="keys")
+        mode_row = tk.Frame(form, bg="#f6f7f8")
+        mode_row.pack(fill="x")
+        tk.Radiobutton(
+            mode_row, text="快捷鍵", variable=mode_var, value="keys", bg="#f6f7f8",
+            command=lambda: apply_mode(),
+        ).pack(side="left")
+        tk.Radiobutton(
+            mode_row, text="啟動程式", variable=mode_var, value="run", bg="#f6f7f8",
+            command=lambda: apply_mode(),
+        ).pack(side="left", padx=8)
+        name_var = tk.StringVar()
+        tk.Label(form, text="名稱", bg="#f6f7f8", font=FONT_UI).pack(anchor="w")
+        name_entry = tk.Entry(form, textvariable=name_var, font=FONT_UI)
+        name_entry.pack(fill="x", pady=(0, 6))
+        keys_box = tk.Frame(form, bg="#f6f7f8")
+        keys_box.pack(fill="x")
         mods = {name: tk.BooleanVar() for name in ("ctrl", "shift", "alt", "win")}
-        mod_row = tk.Frame(form, bg="#f6f7f8")
+        mod_row = tk.Frame(keys_box, bg="#f6f7f8")
         mod_row.pack(fill="x", pady=2)
         for name, label in (("ctrl", "Ctrl"), ("shift", "Shift"), ("alt", "Alt"), ("win", "Win")):
             tk.Checkbutton(
                 mod_row, text=label, variable=mods[name], bg="#f6f7f8",
                 command=lambda: preview(),
             ).pack(side="left", padx=4)
-        key_row = tk.Frame(form, bg="#f6f7f8")
+        key_row = tk.Frame(keys_box, bg="#f6f7f8")
         key_row.pack(fill="x", pady=4)
         tk.Label(key_row, text="主鍵", bg="#f6f7f8", font=FONT_UI).pack(side="left")
         key_var = tk.StringVar()
@@ -3700,10 +3987,19 @@ class ActionBar:
         capture_btn.pack(side="left")
         preview_var = tk.StringVar(value="預覽：")
         tk.Label(key_row, textvariable=preview_var, bg="#f6f7f8", font=FONT_UI).pack(side="left", padx=8)
-        name_var = tk.StringVar()
-        tk.Label(form, text="名稱", bg="#f6f7f8", font=FONT_UI).pack(anchor="w")
-        name_entry = tk.Entry(form, textvariable=name_var, font=FONT_UI)
-        name_entry.pack(fill="x", pady=(0, 6))
+        run_box = tk.Frame(form, bg="#f6f7f8")
+        run_list = tk.Frame(run_box, bg="#f6f7f8")
+        run_list.pack(fill="x")
+        tk.Label(
+            run_box,
+            text="工作目錄空白時，用你的使用者資料夾。參數整段照你寫的傳過去。",
+            bg="#f6f7f8",
+            fg="#5f6368",
+            font=FONT_HINT,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 2))
+        tk.Button(run_box, text="加一個程式", command=lambda: add_program_row()).pack(anchor="w", pady=(0, 4))
+        program_rows: list[dict] = []
         group_host = tk.Frame(form, bg="#f6f7f8")
         group_host.pack(fill="x")
         group_vars: dict[int, tk.BooleanVar] = {}
@@ -3726,6 +4022,98 @@ class ActionBar:
 
         def selected_groups() -> list[int]:
             return [gid for gid, var in group_vars.items() if var.get()]
+
+        def browse_file(var: tk.StringVar) -> None:
+            picked = filedialog.askopenfilename(parent=win, title="程式")
+            if picked:
+                var.set(picked)
+
+        def browse_dir(var: tk.StringVar) -> None:
+            picked = filedialog.askdirectory(parent=win, title="工作目錄")
+            if picked:
+                var.set(picked)
+
+        def repack_programs() -> None:
+            for entry in program_rows:
+                entry["frame"].pack_forget()
+            for entry in program_rows:
+                entry["frame"].pack(fill="x", pady=2)
+
+        def remove_program(entry: dict) -> None:
+            if entry in program_rows:
+                program_rows.remove(entry)
+            try:
+                entry["frame"].destroy()
+            except tk.TclError:
+                pass
+
+        def move_program(entry: dict, delta: int) -> None:
+            index = program_rows.index(entry)
+            target = index + delta
+            if not 0 <= target < len(program_rows):
+                return
+            program_rows[index], program_rows[target] = program_rows[target], program_rows[index]
+            repack_programs()
+
+        def add_program_row(program: dict | None = None) -> None:
+            source = program or {}
+            frame = tk.Frame(run_list, bg="#eef1f4", padx=6, pady=4)
+            path_var = tk.StringVar(value=str(source.get("path") or ""))
+            args_var = tk.StringVar(value=str(source.get("args") or ""))
+            cwd_var = tk.StringVar(value=str(source.get("cwd") or ""))
+            admin_var = tk.BooleanVar(value=source.get("admin") is True or source.get("admin") == 1)
+            entry = {"frame": frame, "path": path_var, "args": args_var, "cwd": cwd_var, "admin": admin_var}
+            program_rows.append(entry)
+            top = tk.Frame(frame, bg="#eef1f4")
+            top.pack(fill="x")
+            tk.Label(top, text="路徑", bg="#eef1f4", font=FONT_HINT).pack(side="left")
+            tk.Entry(top, textvariable=path_var, font=FONT_UI, width=42).pack(side="left", padx=4)
+            tk.Button(top, text="瀏覽", command=lambda var=path_var: browse_file(var)).pack(side="left")
+            tk.Button(top, text="↑", width=2, command=lambda row=entry: move_program(row, -1)).pack(side="left", padx=(8, 0))
+            tk.Button(top, text="↓", width=2, command=lambda row=entry: move_program(row, 1)).pack(side="left")
+            tk.Button(top, text="刪", width=2, command=lambda row=entry: remove_program(row)).pack(side="left", padx=(4, 0))
+            mid = tk.Frame(frame, bg="#eef1f4")
+            mid.pack(fill="x", pady=1)
+            tk.Label(mid, text="參數", bg="#eef1f4", font=FONT_HINT).pack(side="left")
+            tk.Entry(mid, textvariable=args_var, font=FONT_UI).pack(side="left", fill="x", expand=True, padx=4)
+            low = tk.Frame(frame, bg="#eef1f4")
+            low.pack(fill="x")
+            tk.Label(low, text="目錄", bg="#eef1f4", font=FONT_HINT).pack(side="left")
+            tk.Entry(low, textvariable=cwd_var, font=FONT_UI).pack(side="left", fill="x", expand=True, padx=4)
+            tk.Button(low, text="選資料夾", command=lambda var=cwd_var: browse_dir(var)).pack(side="left")
+            tk.Checkbutton(low, text="系統管理員", variable=admin_var, bg="#eef1f4").pack(side="left", padx=6)
+            repack_programs()
+
+        def clear_program_rows() -> None:
+            for entry in list(program_rows):
+                try:
+                    entry["frame"].destroy()
+                except tk.TclError:
+                    pass
+            program_rows.clear()
+
+        def collect_programs() -> list[dict]:
+            return [
+                {
+                    "path": entry["path"].get(),
+                    "args": entry["args"].get(),
+                    "cwd": entry["cwd"].get(),
+                    "admin": bool(entry["admin"].get()),
+                }
+                for entry in program_rows
+            ]
+
+        def apply_mode(*_args) -> None:
+            if mode_var.get() == "run":
+                stop_capture()
+                keys_box.pack_forget()
+                run_box.pack(fill="x", before=group_host)
+                if not program_rows:
+                    add_program_row()
+            else:
+                run_box.pack_forget()
+                if not keys_box.winfo_ismapped():
+                    keys_box.pack(fill="x", before=group_host)
 
         def rebuild_groups(keep: list[int] | None = None) -> None:
             for child in group_host.winfo_children():
@@ -3768,11 +4156,17 @@ class ActionBar:
                     group = next((row for row in self.library["groups"] if row["name"] == chosen), None)
                     if group is None or int(group["id"]) not in linked:
                         continue
-                try:
-                    shown = format_hotkey(item["hotkey"])
-                except ValueError:
-                    shown = str(item.get("hotkey") or "")
-                blob = f"{shown} {item.get('name') or ''} {item.get('hotkey') or ''}".lower()
+                if is_run(item):
+                    programs = normalize_programs(item.get("programs")) or []
+                    shown = run_summary(programs)
+                    extra = " ".join(str(program.get("path") or "") for program in programs)
+                else:
+                    try:
+                        shown = format_hotkey(item["hotkey"])
+                    except (ValueError, KeyError):
+                        shown = str(item.get("hotkey") or "")
+                    extra = str(item.get("hotkey") or "")
+                blob = f"{shown} {item.get('name') or ''} {extra}".lower()
                 if query and query not in blob:
                     continue
                 gid = int(self.library.get("active_group") or 0)
@@ -3794,13 +4188,16 @@ class ActionBar:
             if removing:
                 groups = [value for value in groups if value != gid]
             else:
-                error = check_shortcut(
-                    self.library,
-                    str(item.get("hotkey") or ""),
-                    str(item.get("name") or "").strip(),
-                    [gid],
-                    ignore_id=int(iid),
-                )
+                if is_run(item):
+                    error = check_run(self.library, item.get("programs") or [], ignore_id=int(iid))
+                else:
+                    error = check_shortcut(
+                        self.library,
+                        str(item.get("hotkey") or ""),
+                        str(item.get("name") or "").strip(),
+                        [gid],
+                        ignore_id=int(iid),
+                    )
                 if error:
                     messagebox.showinfo("快捷鍵", error, parent=win)
                     return "break"
@@ -3827,16 +4224,26 @@ class ActionBar:
             if item is None:
                 return
             selected["id"] = int(picked)
+            name_var.set(item.get("name") or "")
+            for gid, var in group_vars.items():
+                var.set(gid in (item.get("groups") or []))
+            clear_program_rows()
+            if is_run(item):
+                mode_var.set("run")
+                for program in item.get("programs") or []:
+                    if isinstance(program, dict):
+                        add_program_row(program)
+                apply_mode()
+                return
+            mode_var.set("keys")
+            apply_mode()
             try:
                 mod_names, key = parse_hotkey(item["hotkey"])
-            except ValueError:
+            except (ValueError, KeyError):
                 return
             for name in mods:
                 mods[name].set(name in mod_names)
             key_var.set("`" if key == "backquote" else DISPLAY_KEY.get(key, key))
-            name_var.set(item.get("name") or "")
-            for gid, var in group_vars.items():
-                var.set(gid in (item.get("groups") or []))
             preview()
 
         def clear_form() -> None:
@@ -3848,6 +4255,9 @@ class ActionBar:
             name_var.set("")
             for var in group_vars.values():
                 var.set(False)
+            mode_var.set("keys")
+            clear_program_rows()
+            apply_mode()
             preview()
 
         def clear_entry() -> None:
@@ -3855,13 +4265,12 @@ class ActionBar:
             tree.selection_remove(tree.selection())
             key_var.set("")
             name_var.set("")
+            if mode_var.get() == "run":
+                clear_program_rows()
+                add_program_row()
             preview()
 
         def apply_edit(creating: bool) -> None:
-            hotkey = current_hotkey()
-            if not hotkey:
-                messagebox.showinfo("快捷鍵", "請選擇主鍵。", parent=win)
-                return
             groups = selected_groups()
             if creating and not groups:
                 if not messagebox.askyesno(
@@ -3871,13 +4280,27 @@ class ActionBar:
                 ):
                     return
             kept = None if creating or selected["id"] is None else int(selected["id"])
-            if creating:
-                error = add_shortcut(self.library, hotkey, name_var.get(), groups)
+            if mode_var.get() == "run":
+                programs = collect_programs()
+                if creating:
+                    error = add_run(self.library, name_var.get(), groups, programs)
+                else:
+                    if kept is None:
+                        messagebox.showinfo("快捷鍵", "請先選一筆再儲存修改。", parent=win)
+                        return
+                    error = update_run(self.library, kept, name_var.get(), groups, programs)
             else:
-                if kept is None:
-                    messagebox.showinfo("快捷鍵", "請先選一筆再儲存修改。", parent=win)
+                hotkey = current_hotkey()
+                if not hotkey:
+                    messagebox.showinfo("快捷鍵", "請選擇主鍵。", parent=win)
                     return
-                error = update_shortcut(self.library, kept, hotkey, name_var.get(), groups)
+                if creating:
+                    error = add_shortcut(self.library, hotkey, name_var.get(), groups)
+                else:
+                    if kept is None:
+                        messagebox.showinfo("快捷鍵", "請先選一筆再儲存修改。", parent=win)
+                        return
+                    error = update_shortcut(self.library, kept, hotkey, name_var.get(), groups)
             if error:
                 messagebox.showinfo("快捷鍵", error, parent=win)
                 return
