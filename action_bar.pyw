@@ -718,18 +718,12 @@ def normalize_pins(raw) -> list[str]:
     return pins
 
 
-def set_pin(pins: list[str], index: int, hotkey: str) -> list[str]:
+def set_pin(pins: list, index: int, value) -> list:
     if not 0 <= index < PIN_COUNT:
         return list(pins)
-    result = ["" if cell == hotkey else cell for cell in pins]
-    result[index] = hotkey
-    return result
-
-
-def clear_pin(pins: list[str], index: int) -> list[str]:
-    result = list(pins)
-    if 0 <= index < PIN_COUNT:
-        result[index] = ""
+    blank = 0 if isinstance(value, int) else ""
+    result = [blank if cell == value else cell for cell in pins]
+    result[index] = value
     return result
 
 
@@ -1308,24 +1302,6 @@ def stored_disabled() -> set[str]:
     return {str(item).strip() for item in data.get("disabled") or [] if str(item).strip()}
 
 
-def duplicate_message(
-    shortcuts: list[dict],
-    hotkey: str,
-    label: str,
-    ignore_id: str | None = None,
-) -> str | None:
-    hotkey = canonical_hotkey(hotkey)
-    label = label.strip()
-    for item in shortcuts:
-        if item["id"] == ignore_id:
-            continue
-        if item["hotkey"] == hotkey:
-            return f"{format_hotkey(hotkey)} 已經用在「{item['label']}」。"
-        if item["label"] == label:
-            return f"名稱「{label}」已經有了。"
-    return None
-
-
 SEED_GROUPS = (
     (1, "編輯"),
     (2, "檔案總管"),
@@ -1506,8 +1482,9 @@ def update_shortcut(library: dict, sid: int, hotkey: str, name: str, group_ids: 
 
 def delete_shortcut(library: dict, sid: int) -> None:
     library["shortcuts"] = [item for item in library.get("shortcuts") or [] if item.get("id") != sid]
-    library["pins"] = [0 if pin == sid else pin for pin in normalize_pin_ids(library.get("pins"), {item["id"] for item in library["shortcuts"]} | {sid})]
-    library["pins"] = normalize_pin_ids(library["pins"], {item["id"] for item in library["shortcuts"]})
+    valid = library_pin_ids(library) | {int(sid)}
+    library["pins"] = [0 if pin == sid else pin for pin in normalize_pin_ids(library.get("pins"), valid)]
+    library["pins"] = normalize_pin_ids(library["pins"], library_pin_ids(library))
 
 
 def group_name_taken(library: dict, name: str, ignore_id: int | None = None) -> bool:
@@ -1569,97 +1546,156 @@ def delete_group_row(library: dict, gid: int) -> str | None:
     return None
 
 
+def _positive_id(value) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+def library_pin_ids(library: dict) -> set[int]:
+    found: set[int] = set()
+    for key in ("shortcuts", "retained"):
+        for item in library.get(key) or []:
+            if isinstance(item, dict):
+                sid = _positive_id(item.get("id"))
+                if sid:
+                    found.add(sid)
+    return found
+
+
 def ensure_counters(library: dict) -> None:
     group_ids = [int(group["id"]) for group in library.get("groups") or [] if isinstance(group.get("id"), int)]
     shortcut_ids = [int(item["id"]) for item in library.get("shortcuts") or [] if isinstance(item.get("id"), int)]
+    for item in library.get("retained_groups") or []:
+        if isinstance(item, dict) and _positive_id(item.get("id")):
+            group_ids.append(_positive_id(item.get("id")))
+    for item in library.get("retained") or []:
+        if isinstance(item, dict) and _positive_id(item.get("id")):
+            shortcut_ids.append(_positive_id(item.get("id")))
     library["next_group_id"] = max(int(library.get("next_group_id") or 1), max(group_ids, default=0) + 1)
     library["next_shortcut_id"] = max(int(library.get("next_shortcut_id") or 1), max(shortcut_ids, default=0) + 1)
 
 
 def repair_v2(data: dict) -> tuple[dict, list[str]]:
     problems: list[str] = []
-    groups: list[dict] = []
-    seen_groups: set[int] = set()
+    retained_groups: list[dict] = []
     seen_names: set[str] = set()
-    next_group = 1
-    remap: dict[int, int] = {}
+    kept_groups: list[tuple[dict, str, int]] = []
     for item in data.get("groups") or []:
         if not isinstance(item, dict):
+            problems.append("略過無法讀取的群組。")
             continue
         name = str(item.get("name") or "").strip()
         if not name or name in seen_names:
+            retained_groups.append(dict(item))
             problems.append(f"略過群組「{name or '未命名'}」。")
             continue
-        try:
-            gid = int(item.get("id"))
-        except (TypeError, ValueError):
-            gid = 0
-        if gid <= 0 or gid in seen_groups:
-            gid = next_group
-            while gid in seen_groups:
-                gid += 1
-            problems.append(f"群組「{name}」的編號已重編為 {gid}。")
-        seen_groups.add(gid)
         seen_names.add(name)
-        next_group = max(next_group, gid + 1)
-        original = item.get("id")
-        try:
-            remap[int(original)] = gid
-        except (TypeError, ValueError):
-            pass
-        groups.append({"id": gid, "name": name})
+        kept_groups.append((item, name, _positive_id(item.get("id"))))
+    claimed_groups: set[int] = set()
+    pending_groups: list[tuple[dict, str, int, int | None]] = []
+    for item, name, gid in kept_groups:
+        if gid and gid not in claimed_groups:
+            claimed_groups.add(gid)
+            pending_groups.append((item, name, gid, gid))
+        else:
+            pending_groups.append((item, name, gid, None))
+    for item in retained_groups:
+        claimed_groups.add(_positive_id(item.get("id")))
+    claimed_groups.discard(0)
+    next_group = max(claimed_groups, default=0) + 1
+    remap: dict[int, int] = {}
+    groups: list[dict] = []
+    for item, name, gid, assigned in pending_groups:
+        if assigned is None:
+            assigned = next_group
+            next_group += 1
+            problems.append(f"群組「{name}」的編號已重編為 {assigned}。")
+        else:
+            remap.setdefault(gid, assigned)
+        row = dict(item)
+        row["id"] = assigned
+        row["name"] = name
+        groups.append(row)
     if not groups:
-        groups = [{"id": 1, "name": "常用"}]
+        groups = [{"id": next_group, "name": "常用"}]
+        next_group += 1
         problems.append("沒有群組，已暫時使用「常用」。")
-    valid_groups = {group["id"] for group in groups}
-    shortcuts: list[dict] = []
-    seen_shortcuts: set[int] = set()
-    next_shortcut = 1
+    valid_groups = {int(group["id"]) for group in groups}
+
+    retained: list[dict] = []
+    parsed_shortcuts: list[tuple[dict, str, int]] = []
     for item in data.get("shortcuts") or []:
         if not isinstance(item, dict):
+            problems.append("略過無法讀取的快捷鍵。")
             continue
         try:
             hotkey = canonical_hotkey(str(item.get("hotkey") or ""))
         except ValueError:
+            retained.append(dict(item))
             problems.append(f"略過無效組合：{item.get('hotkey')}")
             continue
-        try:
-            sid = int(item.get("id"))
-        except (TypeError, ValueError):
-            sid = 0
-        if sid <= 0 or sid in seen_shortcuts:
-            sid = next_shortcut
-            while sid in seen_shortcuts:
-                sid += 1
-            problems.append(f"快捷鍵 {hotkey} 的編號已重編為 {sid}。")
-        seen_shortcuts.add(sid)
-        next_shortcut = max(next_shortcut, sid + 1)
+        parsed_shortcuts.append((item, hotkey, _positive_id(item.get("id"))))
+    claimed: set[int] = set()
+    pending_shortcuts: list[tuple[dict, str, int | None]] = []
+    for item, hotkey, sid in parsed_shortcuts:
+        if sid and sid not in claimed:
+            claimed.add(sid)
+            pending_shortcuts.append((item, hotkey, sid))
+        else:
+            pending_shortcuts.append((item, hotkey, None))
+    for item in retained:
+        claimed.add(_positive_id(item.get("id")))
+    claimed.discard(0)
+    next_shortcut = max(claimed, default=0) + 1
+    shortcuts: list[dict] = []
+    for item, hotkey, assigned in pending_shortcuts:
+        if assigned is None:
+            assigned = next_shortcut
+            next_shortcut += 1
+            problems.append(f"快捷鍵 {hotkey} 的編號已重編為 {assigned}。")
         linked: list[int] = []
         for value in item.get("groups") or []:
-            try:
-                gid = remap.get(int(value), int(value))
-            except (TypeError, ValueError):
-                continue
+            gid = _positive_id(value)
+            gid = remap.get(gid, gid)
             if gid in valid_groups and gid not in linked:
                 linked.append(gid)
-        shortcuts.append({"id": sid, "hotkey": hotkey, "name": str(item.get("name") or "").strip(), "groups": linked})
-    valid_shortcuts = {item["id"] for item in shortcuts}
-    try:
-        active = int(data.get("active_group") or 0)
-    except (TypeError, ValueError):
-        active = 0
+        row = dict(item)
+        row["id"] = assigned
+        row["hotkey"] = hotkey
+        row["name"] = str(item.get("name") or "").strip()
+        row["groups"] = linked
+        shortcuts.append(row)
+    valid_ids = {int(item["id"]) for item in shortcuts}
+    for item in retained:
+        sid = _positive_id(item.get("id"))
+        if sid:
+            valid_ids.add(sid)
+    active = _positive_id(data.get("active_group"))
     active = remap.get(active, active)
     if active not in valid_groups:
         active = int(groups[0]["id"])
     library = {
-        "version": 2,
-        "next_group_id": 1,
-        "next_shortcut_id": 1,
-        "active_group": active,
-        "groups": groups,
-        "shortcuts": shortcuts,
-        "pins": normalize_pin_ids(data.get("pins"), valid_shortcuts),
+        key: value
+        for key, value in data.items()
+        if key not in {"groups", "shortcuts", "pins", "active_group", "version", "next_group_id", "next_shortcut_id"}
+        and not str(key).startswith("_")
     }
+    library.update(
+        {
+            "version": 2,
+            "active_group": active,
+            "groups": groups,
+            "shortcuts": shortcuts,
+            "pins": normalize_pin_ids(data.get("pins"), valid_ids),
+            "retained": retained,
+            "retained_groups": retained_groups,
+        }
+    )
     ensure_counters(library)
     return library, problems
 
@@ -1755,7 +1791,17 @@ def migrate_v1(data) -> dict:
 
 
 def save_library(library: dict) -> None:
-    payload = {key: value for key, value in library.items() if not str(key).startswith("_")}
+    payload = {
+        key: value
+        for key, value in library.items()
+        if not str(key).startswith("_") and key not in ("retained", "retained_groups")
+    }
+    payload["shortcuts"] = list(payload.get("shortcuts") or []) + [
+        item for item in library.get("retained") or [] if isinstance(item, dict)
+    ]
+    payload["groups"] = list(payload.get("groups") or []) + [
+        item for item in library.get("retained_groups") or [] if isinstance(item, dict)
+    ]
     temporary = SHORTCUTS_PATH.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(SHORTCUTS_PATH)
@@ -1770,11 +1816,17 @@ def open_library() -> tuple[dict, str | None]:
     except Exception:
         log_exc()
         return fresh_library(), "快捷鍵檔讀不起來。這次不會覆寫原檔，畫面上的是暫時資料。"
-    if isinstance(data, dict) and data.get("version") == 2:
-        library, problems = repair_v2(data)
-        for line in problems:
-            log_note(line)
-        return library, None
+    if isinstance(data, dict):
+        version = data.get("version")
+        version_number = version if isinstance(version, int) and not isinstance(version, bool) else None
+        shaped = isinstance(data.get("groups"), list) and isinstance(data.get("shortcuts"), list)
+        if version_number is not None and version_number > 2:
+            return fresh_library(), "快捷鍵檔是較新的版本。這次不會覆寫原檔，畫面上的是暫時資料。"
+        if version_number == 2 or (version_number is None and shaped):
+            library, problems = repair_v2(data)
+            for line in problems:
+                log_note(line)
+            return library, None
     try:
         if not BACKUP_PATH.exists():
             BACKUP_PATH.write_text(raw, encoding="utf-8")
@@ -2165,7 +2217,7 @@ class ActionBar:
         self._pin_rule(pad, 2, (4, 3))
         self._pin_parent = pad
         self._pin_frames = []
-        for index, sid in enumerate(normalize_pin_ids(self.library.get("pins"), set(self._by_id))):
+        for index, sid in enumerate(normalize_pin_ids(self.library.get("pins"), library_pin_ids(self.library))):
             cell = self._make_pin_key(pad, index, int(sid))
             cell.grid(row=3, column=index, padx=2, pady=2)
             self._pin_frames.append(cell)
@@ -2776,7 +2828,7 @@ class ActionBar:
     def _place_pin(self, index: int, sid: int) -> None:
         if self._editors or self._library_readonly:
             return
-        valid = set(self._by_id)
+        valid = library_pin_ids(self.library)
         old = normalize_pin_ids(self.library.get("pins"), valid)
         new = set_pin(old, index, int(sid))
         if new == old:
@@ -2788,7 +2840,7 @@ class ActionBar:
     def clear_pin_cell(self, index: int) -> None:
         if self._editors or self._library_readonly:
             return
-        valid = set(self._by_id)
+        valid = library_pin_ids(self.library)
         old = normalize_pin_ids(self.library.get("pins"), valid)
         new = list(old)
         if 0 <= index < PIN_COUNT:
@@ -2827,7 +2879,7 @@ class ActionBar:
 
     def _open_pin_menu(self, event, index: int) -> None:
         rows = self._bar_rows()
-        pins = normalize_pin_ids(self.library.get("pins"), set(self._by_id))
+        pins = normalize_pin_ids(self.library.get("pins"), library_pin_ids(self.library))
         if index < len(pins) and pins[index]:
             rows = [("清空這格", lambda i=index: self.clear_pin_cell(i)), None, *rows]
         self._open_menu(event.x_root, event.y_root, rows)
@@ -3387,16 +3439,19 @@ class ActionBar:
         if mtime is None or mtime == self._shortcuts_mtime:
             return
         try:
-            self.library, message = open_library()
-            if message:
-                self._library_readonly = True
-                self._library_message = message
-            self._reindex()
-            self.shortcuts = materialize(self.library)
+            library, message = open_library()
         except Exception:
             log_exc()
             self._shortcuts_mtime = mtime
             return
+        self._library_readonly = message is not None
+        self._library_message = message
+        self._shortcuts_mtime = mtime
+        if message:
+            return
+        self.library = library
+        self._reindex()
+        self.shortcuts = materialize(self.library)
         self._shortcuts_mtime = shortcuts_mtime()
         self.relayout()
 
@@ -3406,7 +3461,12 @@ class ActionBar:
     def _store(self) -> None:
         if self._library_readonly:
             return
-        save_library(self.library)
+        try:
+            save_library(self.library)
+        except Exception:
+            log_exc()
+            messagebox.showerror("快捷鍵", "快捷鍵檔沒有寫入。請看 error.log。")
+            return
         self._shortcuts_mtime = shortcuts_mtime()
         self._reindex()
 
@@ -3565,20 +3625,28 @@ class ActionBar:
         filter_var = tk.StringVar(value="全部")
         filter_box = ttk.Combobox(top, textvariable=filter_var, state="readonly", width=16)
         filter_box.pack(side="left", padx=(6, 12))
+        tk.Label(top, text="勾了「顯示」才出現在目前的群組", bg="#f6f7f8", fg="#5f6368", font=FONT_HINT).pack(side="left")
         tk.Label(top, text="搜尋", bg="#f6f7f8", font=FONT_UI).pack(side="left")
         search_var = tk.StringVar()
         tk.Entry(top, textvariable=search_var, font=FONT_UI, width=24).pack(side="left", padx=6)
         manage_btn = tk.Button(top, text="群組管理…")
         manage_btn.pack(side="right")
 
-        tree = ttk.Treeview(outer, columns=("hotkey", "name", "groups"), show="headings", height=12)
+        tree_wrap = tk.Frame(outer, bg="#f6f7f8")
+        tree_wrap.pack(fill="both", expand=True, pady=8)
+        tree = ttk.Treeview(tree_wrap, columns=("shown", "hotkey", "name", "groups"), show="headings", height=12)
+        tree.heading("shown", text="顯示")
         tree.heading("hotkey", text="快捷鍵")
         tree.heading("name", text="名稱")
         tree.heading("groups", text="群組")
-        tree.column("hotkey", width=180, anchor="w")
-        tree.column("name", width=160, anchor="w")
-        tree.column("groups", width=280, anchor="w")
-        tree.pack(fill="both", expand=True, pady=8)
+        tree.column("shown", width=52, anchor="center", stretch=False)
+        tree.column("hotkey", width=170, anchor="w")
+        tree.column("name", width=140, anchor="w")
+        tree.column("groups", width=240, anchor="w")
+        scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
 
         form = tk.Frame(outer, bg="#f6f7f8")
         form.pack(fill="x")
@@ -3676,7 +3744,33 @@ class ActionBar:
                 blob = f"{shown} {item.get('name') or ''} {item.get('hotkey') or ''}".lower()
                 if query and query not in blob:
                     continue
-                tree.insert("", "end", iid=str(item["id"]), values=(shown, item.get("name") or "", group_text(item)))
+                gid = int(self.library.get("active_group") or 0)
+                mark = "☑" if gid and gid in linked else "☐"
+                tree.insert("", "end", iid=str(item["id"]), values=(mark, shown, item.get("name") or "", group_text(item)))
+
+        def toggle_shown(event):
+            if self._library_readonly or tree.identify_region(event.x, event.y) != "cell":
+                return
+            if tree.identify_column(event.x) != "#1":
+                return
+            iid = tree.identify_row(event.y)
+            item = shortcut_by_id(self.library, int(iid)) if iid else None
+            gid = int(self.library.get("active_group") or 0)
+            if item is None or not gid:
+                return "break"
+            groups = [int(value) for value in item.get("groups") or []]
+            if gid in groups:
+                groups = [value for value in groups if value != gid]
+            else:
+                groups.append(gid)
+            item["groups"] = groups
+            if selected["id"] == int(iid) and gid in group_vars:
+                group_vars[gid].set(gid in groups)
+            self._store()
+            self.shortcuts = materialize(self.library)
+            self.relayout()
+            refresh()
+            return "break"
 
         def load_selected(_event=None) -> None:
             picked = tree.focus()
@@ -3709,27 +3803,49 @@ class ActionBar:
                 var.set(False)
             preview()
 
+        def clear_entry() -> None:
+            selected["id"] = None
+            tree.selection_remove(tree.selection())
+            key_var.set("")
+            name_var.set("")
+            preview()
+
         def apply_edit(creating: bool) -> None:
             hotkey = current_hotkey()
             if not hotkey:
                 messagebox.showinfo("快捷鍵", "請選擇主鍵。", parent=win)
                 return
+            groups = selected_groups()
+            if creating and not groups:
+                if not messagebox.askyesno(
+                    "快捷鍵",
+                    "沒有勾選群組，這一筆會變成未分組，列上看不到。仍要新增嗎？",
+                    parent=win,
+                ):
+                    return
+            kept = None if creating or selected["id"] is None else int(selected["id"])
             if creating:
-                error = add_shortcut(self.library, hotkey, name_var.get(), selected_groups())
+                error = add_shortcut(self.library, hotkey, name_var.get(), groups)
             else:
-                if selected["id"] is None:
+                if kept is None:
                     messagebox.showinfo("快捷鍵", "請先選一筆再儲存修改。", parent=win)
                     return
-                error = update_shortcut(
-                    self.library, int(selected["id"]), hotkey, name_var.get(), selected_groups()
-                )
+                error = update_shortcut(self.library, kept, hotkey, name_var.get(), groups)
             if error:
                 messagebox.showinfo("快捷鍵", error, parent=win)
                 return
             self._store()
             refresh()
             if creating:
-                clear_form()
+                clear_entry()
+            elif kept is not None:
+                selected["id"] = kept
+                try:
+                    tree.selection_set(str(kept))
+                    tree.focus(str(kept))
+                    tree.see(str(kept))
+                except tk.TclError:
+                    pass
 
         def remove_selected() -> None:
             if selected["id"] is None:
@@ -3744,10 +3860,11 @@ class ActionBar:
         def stop_capture() -> None:
             capturing["on"] = False
             self._capturing = False
-            if capturing["bind"] is not None:
-                capturing["bind"] = None
+            funcid = capturing["bind"]
+            capturing["bind"] = None
+            if funcid is not None:
                 try:
-                    win.unbind_all("<KeyPress>")
+                    win._unbind(("bind", "all", "<KeyPress>"), funcid)
                 except tk.TclError:
                     pass
             try:
@@ -3763,13 +3880,17 @@ class ActionBar:
             if code == 27 or str(getattr(event, "keysym", "")) == "Escape":
                 stop_capture()
                 return "break"
-            if code in MODIFIER_KEYCODES:
+            if code in MODIFIER_KEYCODES or code == 229:
+                if code == 229:
+                    preview_var.set("預覽：這個鍵無法擷取，請用下拉")
                 return "break"
             name = VK_TO_KEY.get(code)
             if name:
                 key_var.set("`" if name == "backquote" else DISPLAY_KEY.get(name, name))
                 preview()
                 stop_capture()
+            else:
+                preview_var.set("預覽：這個鍵無法擷取，請用下拉")
             return "break"
 
         def toggle_capture() -> None:
@@ -3786,9 +3907,33 @@ class ActionBar:
                 pass
             capturing["bind"] = win.bind_all("<KeyPress>", on_key)
 
+        def capture_inside() -> bool:
+            try:
+                focus = win.focus_get()
+            except tk.TclError:
+                return False
+            if focus is None:
+                return False
+            try:
+                return focus.winfo_toplevel() == win
+            except tk.TclError:
+                return False
+
+        def check_capture_focus() -> None:
+            if capturing["on"] and not capture_inside():
+                stop_capture()
+
+        def on_focus_out(_event) -> None:
+            if capturing["on"] and win.winfo_exists():
+                win.after(20, check_capture_focus)
+
+        focus_bind = win.bind_all("<FocusOut>", on_focus_out, add="+")
+
         def close() -> None:
             try:
                 stop_capture()
+                if focus_bind is not None:
+                    win._unbind(("bind", "all", "<FocusOut>"), focus_bind)
             finally:
                 try:
                     if win.winfo_exists():
@@ -3810,6 +3955,7 @@ class ActionBar:
         tk.Button(buttons, text="刪除", command=remove_selected).pack(side="left")
         tk.Button(buttons, text="清空表單", command=clear_form).pack(side="left", padx=6)
         tk.Button(buttons, text="關閉", command=close).pack(side="right")
+        tree.bind("<Button-1>", toggle_shown)
         tree.bind("<<TreeviewSelect>>", load_selected)
         search_var.trace_add("write", lambda *_args: refresh())
         filter_box.bind("<<ComboboxSelected>>", refresh)
@@ -4150,10 +4296,6 @@ def run_check() -> int:
             print("bad", ident, label, hotkey)
             failed += 1
     print(f"catalog {len(CATALOG)} failed {failed}")
-    sample = [{"id": "copy", "group": "編輯", "label": "複製", "hotkey": "ctrl+c"}]
-    print("dup-key", duplicate_message(sample, "ctrl-c", "別的"))
-    print("dup-name", duplicate_message(sample, "ctrl+shift+k", "複製"))
-    print("fresh", duplicate_message(sample, "ctrl+shift+k", "別的"))
     print("toggle", format_hotkey("ctrl-alt-shift-h"))
     mon = (0, 0, 1920, 1080)
     print("right", popup_origin(400, 500, 200, 400, mon, "right"))
