@@ -4,7 +4,7 @@ set "ASK=0"
 if exist shortcuts.json set "ASK=1"
 if exist config.json set "ASK=1"
 if "%ASK%"=="1" (
-  choice /m "已有 config.json 或 shortcuts.json。先備份再覆蓋嗎"
+  choice /m "config.json or shortcuts.json already exists. Back up and overwrite"
   if errorlevel 2 exit /b 0
   if exist config.json copy /y config.json config.before-generate.json >nul
   if exist shortcuts.json copy /y shortcuts.json shortcuts.before-generate.json >nul
