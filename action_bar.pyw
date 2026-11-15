@@ -1326,34 +1326,469 @@ def duplicate_message(
     return None
 
 
-def load_library() -> dict:
-    data = None
-    if SHORTCUTS_PATH.exists():
+SEED_GROUPS = (
+    (1, "編輯"),
+    (2, "檔案總管"),
+    (3, "視窗"),
+    (4, "系統"),
+    (5, "瀏覽器"),
+    (6, "媒體"),
+    (7, "常用"),
+    (8, "自訂"),
+)
+CATALOG_GROUP_NAME = {"虛擬桌面": "視窗"}
+MODIFIER_KEYCODES = {16, 17, 18, 91, 92, 160, 161, 162, 163, 164, 165}
+BACKUP_PATH = APP_DIR / "shortcuts.v1.bak.json"
+VK_TO_KEY = {}
+for _name, _vk in KEY_VK.items():
+    VK_TO_KEY.setdefault(_vk, _name)
+
+
+def log_note(text: str) -> None:
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(text.rstrip() + "\n")
+    except Exception:
+        pass
+
+
+def seed_ids() -> dict[str, int]:
+    return {name: gid for gid, name in SEED_GROUPS}
+
+
+def group_by_id(library: dict, gid: int) -> dict | None:
+    for group in library.get("groups") or []:
+        if group.get("id") == gid:
+            return group
+    return None
+
+
+def group_name_of(library: dict, gid: int) -> str:
+    group = group_by_id(library, gid)
+    return str(group.get("name") or "") if group else ""
+
+
+def shortcut_by_id(library: dict, sid: int) -> dict | None:
+    for item in library.get("shortcuts") or []:
+        if item.get("id") == sid:
+            return item
+    return None
+
+
+def normalize_pin_ids(raw, valid: set[int]) -> list[int]:
+    cells = list(raw) if isinstance(raw, (list, tuple)) else []
+    cells = (cells + [0] * PIN_COUNT)[:PIN_COUNT]
+    pins: list[int] = []
+    for cell in cells:
         try:
-            data = json.loads(SHORTCUTS_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            log_exc()
+            sid = int(cell)
+        except (TypeError, ValueError):
+            sid = 0
+        pins.append(sid if sid in valid else 0)
+    seen: set[int] = set()
+    for index in range(PIN_COUNT - 1, -1, -1):
+        if not pins[index]:
+            continue
+        if pins[index] in seen:
+            pins[index] = 0
+        else:
+            seen.add(pins[index])
+    return pins
+
+
+def fresh_library() -> dict:
+    ids = seed_ids()
+    shortcuts: list[dict] = []
+    next_sid = 1
+    for _id, group, label, hotkey in CATALOG:
+        gid = ids[CATALOG_GROUP_NAME.get(group, group)]
+        shortcuts.append(
+            {"id": next_sid, "hotkey": canonical_hotkey(hotkey), "name": label, "groups": [gid]}
+        )
+        next_sid += 1
+    library = {
+        "version": 2,
+        "next_group_id": 9,
+        "next_shortcut_id": next_sid,
+        "active_group": 0,
+        "groups": [{"id": gid, "name": name} for gid, name in SEED_GROUPS],
+        "shortcuts": shortcuts,
+        "pins": [0] * PIN_COUNT,
+    }
+    library["active_group"] = first_occupied(library)
+    return library
+
+
+def first_occupied(library: dict) -> int:
+    counts: dict[int, int] = {}
+    for item in library.get("shortcuts") or []:
+        for gid in item.get("groups") or []:
+            counts[int(gid)] = counts.get(int(gid), 0) + 1
+    for group in library.get("groups") or []:
+        if counts.get(int(group["id"])):
+            return int(group["id"])
+    groups = library.get("groups") or []
+    return int(groups[0]["id"]) if groups else 0
+
+
+def members_of(library: dict, group_id: int) -> list[dict]:
+    name = group_name_of(library, group_id)
+    rows: list[dict] = []
+    for item in library.get("shortcuts") or []:
+        if group_id not in (item.get("groups") or []):
+            continue
+        rows.append(
+            {
+                "id": item["id"],
+                "group": name,
+                "label": str(item.get("name") or "").strip(),
+                "hotkey": item["hotkey"],
+                "builtin": False,
+                "enabled": True,
+            }
+        )
+    return rows
+
+
+def materialize(library: dict) -> list[dict]:
+    return members_of(library, int(library.get("active_group") or 0))
+
+
+def visible_pairs(library: dict, group_id: int) -> list[tuple[str, str]]:
+    return [(item["hotkey"], item["label"]) for item in members_of(library, group_id)]
+
+
+def check_shortcut(library: dict, hotkey: str, name: str, group_ids: list[int], ignore_id: int | None = None) -> str | None:
+    name = str(name or "").strip()
+    for item in library.get("shortcuts") or []:
+        if ignore_id is not None and item.get("id") == ignore_id:
+            continue
+        if item.get("hotkey") == hotkey and str(item.get("name") or "").strip() == name:
+            return "已有這一筆，請在它的群組欄勾選要加入的群組。"
+    for gid in group_ids:
+        for item in library.get("shortcuts") or []:
+            if ignore_id is not None and item.get("id") == ignore_id:
+                continue
+            if item.get("hotkey") == hotkey and gid in (item.get("groups") or []):
+                label = str(item.get("name") or "").strip() or format_hotkey(hotkey)
+                return f"「{group_name_of(library, gid)}」已有 {format_hotkey(hotkey)}（{label}）。"
+    return None
+
+
+def add_shortcut(library: dict, hotkey: str, name: str, group_ids: list[int]) -> str | None:
+    hotkey = canonical_hotkey(hotkey)
+    name = str(name or "").strip()
+    groups = [int(gid) for gid in group_ids]
+    error = check_shortcut(library, hotkey, name, groups)
+    if error:
+        return error
+    sid = int(library.get("next_shortcut_id") or 1)
+    library["next_shortcut_id"] = sid + 1
+    library.setdefault("shortcuts", []).append({"id": sid, "hotkey": hotkey, "name": name, "groups": groups})
+    return None
+
+
+def update_shortcut(library: dict, sid: int, hotkey: str, name: str, group_ids: list[int]) -> str | None:
+    item = shortcut_by_id(library, sid)
+    if item is None:
+        return "找不到這一筆。"
+    hotkey = canonical_hotkey(hotkey)
+    name = str(name or "").strip()
+    groups = [int(gid) for gid in group_ids]
+    error = check_shortcut(library, hotkey, name, groups, ignore_id=sid)
+    if error:
+        return error
+    item["hotkey"] = hotkey
+    item["name"] = name
+    item["groups"] = groups
+    return None
+
+
+def delete_shortcut(library: dict, sid: int) -> None:
+    library["shortcuts"] = [item for item in library.get("shortcuts") or [] if item.get("id") != sid]
+    library["pins"] = [0 if pin == sid else pin for pin in normalize_pin_ids(library.get("pins"), {item["id"] for item in library["shortcuts"]} | {sid})]
+    library["pins"] = normalize_pin_ids(library["pins"], {item["id"] for item in library["shortcuts"]})
+
+
+def group_name_taken(library: dict, name: str, ignore_id: int | None = None) -> bool:
+    cleaned = str(name or "").strip()
+    for group in library.get("groups") or []:
+        if ignore_id is not None and group.get("id") == ignore_id:
+            continue
+        if str(group.get("name") or "").strip() == cleaned:
+            return True
+    return False
+
+
+def add_group_row(library: dict, name: str) -> str | None:
+    cleaned = str(name or "").strip()
+    if not cleaned:
+        return "請輸入群組名稱。"
+    if group_name_taken(library, cleaned):
+        return "這個群組名稱已經有了。"
+    gid = int(library.get("next_group_id") or 1)
+    library["next_group_id"] = gid + 1
+    library.setdefault("groups", []).append({"id": gid, "name": cleaned})
+    return None
+
+
+def rename_group_row(library: dict, gid: int, name: str) -> str | None:
+    group = group_by_id(library, gid)
+    if group is None:
+        return "找不到這個群組。"
+    cleaned = str(name or "").strip()
+    if not cleaned:
+        return "請輸入群組名稱。"
+    if group_name_taken(library, cleaned, ignore_id=gid):
+        return "這個群組名稱已經有了。"
+    group["name"] = cleaned
+    return None
+
+
+def ungrouped_if_removed(library: dict, gid: int) -> int:
+    count = 0
+    for item in library.get("shortcuts") or []:
+        groups = [int(value) for value in item.get("groups") or []]
+        if groups == [gid]:
+            count += 1
+    return count
+
+
+def delete_group_row(library: dict, gid: int) -> str | None:
+    if group_by_id(library, gid) is None:
+        return "找不到這個群組。"
+    for item in library.get("shortcuts") or []:
+        item["groups"] = [int(value) for value in item.get("groups") or [] if int(value) != gid]
+    library["groups"] = [group for group in library.get("groups") or [] if group.get("id") != gid]
+    if not library["groups"]:
+        new_id = int(library.get("next_group_id") or 1)
+        library["next_group_id"] = new_id + 1
+        library["groups"] = [{"id": new_id, "name": "常用"}]
+    if int(library.get("active_group") or 0) not in {group["id"] for group in library["groups"]}:
+        library["active_group"] = int(library["groups"][0]["id"])
+    return None
+
+
+def ensure_counters(library: dict) -> None:
+    group_ids = [int(group["id"]) for group in library.get("groups") or [] if isinstance(group.get("id"), int)]
+    shortcut_ids = [int(item["id"]) for item in library.get("shortcuts") or [] if isinstance(item.get("id"), int)]
+    library["next_group_id"] = max(int(library.get("next_group_id") or 1), max(group_ids, default=0) + 1)
+    library["next_shortcut_id"] = max(int(library.get("next_shortcut_id") or 1), max(shortcut_ids, default=0) + 1)
+
+
+def repair_v2(data: dict) -> tuple[dict, list[str]]:
+    problems: list[str] = []
+    groups: list[dict] = []
+    seen_groups: set[int] = set()
+    seen_names: set[str] = set()
+    next_group = 1
+    remap: dict[int, int] = {}
+    for item in data.get("groups") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or name in seen_names:
+            problems.append(f"略過群組「{name or '未命名'}」。")
+            continue
+        try:
+            gid = int(item.get("id"))
+        except (TypeError, ValueError):
+            gid = 0
+        if gid <= 0 or gid in seen_groups:
+            gid = next_group
+            while gid in seen_groups:
+                gid += 1
+            problems.append(f"群組「{name}」的編號已重編為 {gid}。")
+        seen_groups.add(gid)
+        seen_names.add(name)
+        next_group = max(next_group, gid + 1)
+        original = item.get("id")
+        try:
+            remap[int(original)] = gid
+        except (TypeError, ValueError):
+            pass
+        groups.append({"id": gid, "name": name})
+    if not groups:
+        groups = [{"id": 1, "name": "常用"}]
+        problems.append("沒有群組，已暫時使用「常用」。")
+    valid_groups = {group["id"] for group in groups}
+    shortcuts: list[dict] = []
+    seen_shortcuts: set[int] = set()
+    next_shortcut = 1
+    for item in data.get("shortcuts") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            hotkey = canonical_hotkey(str(item.get("hotkey") or ""))
+        except ValueError:
+            problems.append(f"略過無效組合：{item.get('hotkey')}")
+            continue
+        try:
+            sid = int(item.get("id"))
+        except (TypeError, ValueError):
+            sid = 0
+        if sid <= 0 or sid in seen_shortcuts:
+            sid = next_shortcut
+            while sid in seen_shortcuts:
+                sid += 1
+            problems.append(f"快捷鍵 {hotkey} 的編號已重編為 {sid}。")
+        seen_shortcuts.add(sid)
+        next_shortcut = max(next_shortcut, sid + 1)
+        linked: list[int] = []
+        for value in item.get("groups") or []:
+            try:
+                gid = remap.get(int(value), int(value))
+            except (TypeError, ValueError):
+                continue
+            if gid in valid_groups and gid not in linked:
+                linked.append(gid)
+        shortcuts.append({"id": sid, "hotkey": hotkey, "name": str(item.get("name") or "").strip(), "groups": linked})
+    valid_shortcuts = {item["id"] for item in shortcuts}
+    try:
+        active = int(data.get("active_group") or 0)
+    except (TypeError, ValueError):
+        active = 0
+    active = remap.get(active, active)
+    if active not in valid_groups:
+        active = int(groups[0]["id"])
+    library = {
+        "version": 2,
+        "next_group_id": 1,
+        "next_shortcut_id": 1,
+        "active_group": active,
+        "groups": groups,
+        "shortcuts": shortcuts,
+        "pins": normalize_pin_ids(data.get("pins"), valid_shortcuts),
+    }
+    ensure_counters(library)
+    return library, problems
+
+
+def _append_custom(library: dict, hotkey: str, name: str) -> int:
+    sid = int(library["next_shortcut_id"])
+    library["next_shortcut_id"] = sid + 1
+    library["shortcuts"].append({"id": sid, "hotkey": hotkey, "name": name, "groups": []})
+    return sid
+
+
+def _link(library: dict, sid: int, gid: int) -> None:
+    item = shortcut_by_id(library, sid)
+    if item is None or not gid:
+        return
+    groups = [int(value) for value in item.get("groups") or []]
+    if gid not in groups:
+        groups.append(gid)
+    item["groups"] = groups
+
+
+def migrate_v1(data) -> dict:
     if isinstance(data, dict) and isinstance(data.get("profiles"), list):
-        library = normalize_library(data)
+        old = normalize_library(data)
     else:
-        library = library_from_legacy(data if isinstance(data, dict) else {})
-    if json.dumps(data, ensure_ascii=False, sort_keys=True) != json.dumps(library, ensure_ascii=False, sort_keys=True):
-        save_library(library)
+        old = library_from_legacy(data if isinstance(data, dict) else {})
+    library = fresh_library()
+    ids = seed_ids()
+    shot = next(item["id"] for item in library["shortcuts"] if item["hotkey"] == "ctrl+f5" and item["name"] == "擷圖")
+    hard = next(item["id"] for item in library["shortcuts"] if item["hotkey"] == "ctrl+f5" and item["name"] == "強制重新整理")
+    catalog_hotkeys = {canonical_hotkey(hotkey) for *_rest, hotkey in ((row[0], row[1], row[2], row[3]) for row in CATALOG)}
+    named: dict[str, str] = {}
+    extras: set[str] = set()
+
+    def remember(hotkey: str, name: str = "") -> None:
+        if not hotkey or hotkey in catalog_hotkeys:
+            return
+        extras.add(hotkey)
+        if name and not named.get(hotkey):
+            named[hotkey] = name
+
+    for profile in old["profiles"]:
+        names = profile.get("names") or {}
+        for hotkey, label in names.items():
+            remember(str(hotkey), str(label or "").strip())
+        for hotkey in profile.get("enabled") or []:
+            remember(str(hotkey), str(names.get(hotkey) or "").strip())
+        for hotkey in profile.get("pins") or []:
+            if hotkey:
+                remember(str(hotkey), str(names.get(hotkey) or "").strip())
+    known = {item["hotkey"]: item["id"] for item in library["shortcuts"] if item["hotkey"] != "ctrl+f5"}
+    for hotkey in sorted(extras, key=lambda value: (value.count("+"), value)):
+        sid = _append_custom(library, hotkey, named.get(hotkey, ""))
+        known[hotkey] = sid
+        if named.get(hotkey):
+            _link(library, sid, ids["自訂"])
+
+    def resolve(profile_name: str, hotkey: str) -> int:
+        if hotkey == "ctrl+f5":
+            return hard if profile_name == "瀏覽器" else shot
+        return int(known.get(hotkey) or 0)
+
+    general = next((profile for profile in old["profiles"] if profile.get("name") == "一般"), None)
+    if general is not None:
+        for row in shortcuts_for(general):
+            if row.get("enabled"):
+                _link(library, resolve("一般", row["hotkey"]), ids["常用"])
+    for profile in old["profiles"]:
+        name = str(profile.get("name") or "")
+        if name in ("一般", "瀏覽器"):
+            continue
+        gid = ids.get(name)
+        if gid is None:
+            gid = int(library["next_group_id"])
+            library["next_group_id"] = gid + 1
+            library["groups"].append({"id": gid, "name": name})
+            ids[name] = gid
+        for row in shortcuts_for(profile):
+            if row.get("enabled"):
+                _link(library, resolve(name, row["hotkey"]), gid)
+    for item in library["shortcuts"]:
+        if not item["groups"] and item["hotkey"] in extras:
+            item["groups"] = [ids["自訂"]]
+    active_name = str(old.get("active") or "一般")
+    active = next((profile for profile in old["profiles"] if profile.get("name") == active_name), old["profiles"][0])
+    pins: list[int] = []
+    for hotkey in active.get("pins") or []:
+        pins.append(resolve(active_name, str(hotkey)) if hotkey else 0)
+    library["pins"] = normalize_pin_ids(pins, {item["id"] for item in library["shortcuts"]})
+    library["active_group"] = ids["常用"]
+    ensure_counters(library)
     return library
 
 
 def save_library(library: dict) -> None:
+    payload = {key: value for key, value in library.items() if not str(key).startswith("_")}
     temporary = SHORTCUTS_PATH.with_suffix(".tmp")
-    temporary.write_text(json.dumps(library, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(SHORTCUTS_PATH)
 
 
-def materialize(library: dict) -> list[dict]:
-    active = str(library.get("active") or "一般")
-    profile = next((item for item in library.get("profiles") or [] if item.get("name") == active), None)
-    if profile is None:
-        profile = empty_profile("一般")
-    return shortcuts_for(profile)
+def open_library() -> tuple[dict, str | None]:
+    if not SHORTCUTS_PATH.exists():
+        return fresh_library(), None
+    try:
+        raw = SHORTCUTS_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:
+        log_exc()
+        return fresh_library(), "快捷鍵檔讀不起來。這次不會覆寫原檔，畫面上的是暫時資料。"
+    if isinstance(data, dict) and data.get("version") == 2:
+        library, problems = repair_v2(data)
+        for line in problems:
+            log_note(line)
+        return library, None
+    try:
+        if not BACKUP_PATH.exists():
+            BACKUP_PATH.write_text(raw, encoding="utf-8")
+        library = migrate_v1(data)
+        save_library(library)
+        return library, None
+    except Exception:
+        log_exc()
+        return fresh_library(), "舊的快捷鍵檔轉換失敗。這次不會覆寫原檔，請看 error.log。"
+
+
+def load_library() -> dict:
+    library, _message = open_library()
+    return library
 
 
 def shortcuts_mtime() -> float | None:
@@ -1395,7 +1830,11 @@ def inside(widget: tk.Misc, event) -> bool:
 class ActionBar:
     def __init__(self) -> None:
         self.config = load_config()
-        self.library = load_library()
+        self.library, self._library_message = open_library()
+        self._library_readonly = self._library_message is not None
+        self._by_id: dict[int, dict] = {}
+        self._capturing = False
+        self._reindex()
         self.shortcuts = materialize(self.library)
         self._mtime = config_mtime()
         self._shortcuts_mtime = shortcuts_mtime()
@@ -1473,6 +1912,8 @@ class ActionBar:
         self._install_mouse_hook()
         self.root.after(80, self._pump)
         self.root.after(1500, self._reinforce)
+        if self._library_message:
+            self.root.after(300, lambda: messagebox.showwarning("快捷鍵", self._library_message))
 
     def run(self) -> None:
         self.root.mainloop()
@@ -1600,7 +2041,7 @@ class ActionBar:
         cols = column_count(len(specs), vertical, mon, reserve=136) if specs else 1
         self._build_nav_pad().grid(row=0, column=0, columnspan=cols, padx=2, pady=(2, 4))
         if not specs:
-            empty = tk.Label(self.body, text="沒有選擇快捷鍵", bg=BAR, fg=HINT, font=FONT, padx=16, pady=12)
+            empty = tk.Label(self.body, text="這個群組還沒有快捷鍵，按「選」加入", bg=BAR, fg=HINT, font=FONT, padx=16, pady=12)
             empty.grid(row=1, column=0)
             empty.bind("<Button-3>", self._open_bar_menu)
         else:
@@ -1656,7 +2097,7 @@ class ActionBar:
         self.root.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
 
     def _build_tools(self) -> None:
-        group_name = str(self.library.get("active") or "一般")
+        group_name = self._active_group_name()
         buttons = [
             ("拖", None, True),
             ("選", self.choose_shortcuts, False),
@@ -1724,8 +2165,8 @@ class ActionBar:
         self._pin_rule(pad, 2, (4, 3))
         self._pin_parent = pad
         self._pin_frames = []
-        for index, hotkey in enumerate(normalize_pins(self._active_profile().get("pins"))):
-            cell = self._make_pin_key(pad, index, hotkey)
+        for index, sid in enumerate(normalize_pin_ids(self.library.get("pins"), set(self._by_id))):
+            cell = self._make_pin_key(pad, index, int(sid))
             cell.grid(row=3, column=index, padx=2, pady=2)
             self._pin_frames.append(cell)
         self._pin_rule(pad, 4, (3, 0))
@@ -2131,24 +2572,22 @@ class ActionBar:
         self._cancel_tip_watch()
         self._close_tip_window()
 
-    def _pin_text(self, hotkey: str) -> tuple[str, str]:
+    def _pin_text_for(self, sid: int) -> tuple[str, str, str]:
+        item = self._by_id.get(int(sid or 0))
+        if not item:
+            return "", "", ""
         try:
-            _mods, key = parse_hotkey(hotkey)
+            _mods, key = parse_hotkey(item["hotkey"])
+            full = format_hotkey(item["hotkey"])
         except ValueError:
-            return "", ""
-        label = next(
-            (str(item.get("label") or "").strip() for item in self.shortcuts if item.get("hotkey") == hotkey),
-            "",
-        )
-        try:
-            full = format_hotkey(hotkey)
-        except ValueError:
-            full = hotkey
-        return pin_face(label, display_key(key)), (f"{label} · {full}" if label else full)
+            return "", "", ""
+        label = str(item.get("name") or "").strip()
+        tip = f"{label} · {full}" if label else full
+        return pin_face(label, display_key(key)), tip, item["hotkey"]
 
-    def _make_pin_key(self, parent, index: int, hotkey: str):
-        face, tip = self._pin_text(hotkey) if hotkey else ("", "")
-        filled = bool(hotkey)
+    def _make_pin_key(self, parent, index: int, sid: int):
+        face, tip, hotkey = self._pin_text_for(sid)
+        filled = bool(sid and hotkey)
         bg, edge = ("#dbe6f7", "#8aa0c8") if filled else ("#24262b", "#5a5f6a")
         frame = tk.Frame(
             parent,
@@ -2183,7 +2622,7 @@ class ActionBar:
         frame._pressed = False
         frame._busy = False
         frame._gen = 0
-        spec = {"id": f"pin-{index}", "group": "格子", "label": face, "hotkey": hotkey}
+        spec = {"id": sid, "group": "格子", "label": face, "hotkey": hotkey}
         for widget in (frame, title):
             widget.bind("<Button-3>", lambda event, i=index: self._open_pin_menu(event, i))
             if filled:
@@ -2221,7 +2660,13 @@ class ActionBar:
             drag["frame"]._pressed = False
             self._paint_key_normal(drag["frame"])
             spec = drag["spec"]
-            drag["ghost"] = self._make_ghost(spec["label"] or format_hotkey(spec["hotkey"]), event.x_root, event.y_root)
+            label = spec.get("label") or ""
+            if not label:
+                try:
+                    label = format_hotkey(spec["hotkey"])
+                except ValueError:
+                    label = str(spec.get("hotkey") or "")
+            drag["ghost"] = self._make_ghost(label, event.x_root, event.y_root)
         self._move_ghost(drag["ghost"], event.x_root, event.y_root)
         target = pin_at(event.x_root, event.y_root, self._pin_rects())
         if target != drag["target"]:
@@ -2233,8 +2678,8 @@ class ActionBar:
     def _finish_drag(self, drag, event) -> None:
         self._end_drag_ui(drag)
         index = pin_at(event.x_root, event.y_root, self._pin_rects())
-        if index >= 0:
-            self._place_pin(index, drag["spec"]["hotkey"])
+        if index >= 0 and drag["spec"].get("id"):
+            self._place_pin(index, int(drag["spec"]["id"]))
 
     def _end_drag_ui(self, drag) -> None:
         self._dragging = False
@@ -2328,28 +2773,30 @@ class ActionBar:
         except tk.TclError:
             pass
 
-    def _place_pin(self, index: int, hotkey: str) -> None:
-        try:
-            hotkey = canonical_hotkey(hotkey)
-        except ValueError:
+    def _place_pin(self, index: int, sid: int) -> None:
+        if self._editors or self._library_readonly:
             return
-        profile = self._active_profile()
-        old = normalize_pins(profile.get("pins"))
-        new = set_pin(old, index, hotkey)
+        valid = set(self._by_id)
+        old = normalize_pin_ids(self.library.get("pins"), valid)
+        new = set_pin(old, index, int(sid))
         if new == old:
             return
-        profile["pins"] = new
-        self._save_shortcuts()
+        self.library["pins"] = new
+        self._store()
         self._refresh_pins(old, new)
 
     def clear_pin_cell(self, index: int) -> None:
-        profile = self._active_profile()
-        old = normalize_pins(profile.get("pins"))
-        new = clear_pin(old, index)
+        if self._editors or self._library_readonly:
+            return
+        valid = set(self._by_id)
+        old = normalize_pin_ids(self.library.get("pins"), valid)
+        new = list(old)
+        if 0 <= index < PIN_COUNT:
+            new[index] = 0
         if new == old:
             return
-        profile["pins"] = new
-        self._save_shortcuts()
+        self.library["pins"] = new
+        self._store()
         self._refresh_pins(old, new)
 
     def _refresh_pins(self, old: list, new: list) -> None:
@@ -2380,7 +2827,7 @@ class ActionBar:
 
     def _open_pin_menu(self, event, index: int) -> None:
         rows = self._bar_rows()
-        pins = normalize_pins(self._active_profile().get("pins"))
+        pins = normalize_pin_ids(self.library.get("pins"), set(self._by_id))
         if index < len(pins) and pins[index]:
             rows = [("清空這格", lambda i=index: self.clear_pin_cell(i)), None, *rows]
         self._open_menu(event.x_root, event.y_root, rows)
@@ -2940,7 +3387,11 @@ class ActionBar:
         if mtime is None or mtime == self._shortcuts_mtime:
             return
         try:
-            self.library = load_library()
+            self.library, message = open_library()
+            if message:
+                self._library_readonly = True
+                self._library_message = message
+            self._reindex()
             self.shortcuts = materialize(self.library)
         except Exception:
             log_exc()
@@ -2949,48 +3400,36 @@ class ActionBar:
         self._shortcuts_mtime = shortcuts_mtime()
         self.relayout()
 
-    def _active_profile(self) -> dict:
-        name = str(self.library.get("active") or "一般")
-        for profile in self.library.get("profiles") or []:
-            if profile.get("name") == name:
-                return profile
-        profile = empty_profile("一般")
-        self.library.setdefault("profiles", []).insert(0, profile)
-        self.library["active"] = "一般"
-        return profile
+    def _reindex(self) -> None:
+        self._by_id = {int(item["id"]): item for item in self.library.get("shortcuts") or []}
 
-    def _capture_active(self) -> None:
-        profile = self._active_profile()
-        profile["enabled"] = [item["hotkey"] for item in self.shortcuts if item.get("enabled")]
-        profile["names"] = {
-            item["hotkey"]: str(item.get("label") or "").strip()
-            for item in self.shortcuts
-            if not item.get("builtin") and str(item.get("label") or "").strip()
-        }
-
-    def _save_shortcuts(self) -> None:
-        self._capture_active()
+    def _store(self) -> None:
+        if self._library_readonly:
+            return
         save_library(self.library)
         self._shortcuts_mtime = shortcuts_mtime()
+        self._reindex()
 
-    def activate_group(self, name: str) -> None:
-        if self._editors or name == self.library.get("active"):
+    def _active_group_name(self) -> str:
+        return group_name_of(self.library, int(self.library.get("active_group") or 0)) or "群組"
+
+    def activate_group(self, gid: int) -> None:
+        if self._editors or self._library_readonly or int(gid) == int(self.library.get("active_group") or 0):
             return
-        if not any(item.get("name") == name for item in self.library.get("profiles") or []):
+        if group_by_id(self.library, int(gid)) is None:
             return
-        self._capture_active()
-        self.library["active"] = name
+        self.library["active_group"] = int(gid)
         self.shortcuts = materialize(self.library)
-        save_library(self.library)
-        self._shortcuts_mtime = shortcuts_mtime()
+        self._store()
         self.relayout()
 
     def _open_group_menu(self) -> None:
         rows = []
-        active = self.library.get("active")
-        for profile in self.library.get("profiles") or []:
-            name = profile["name"]
-            rows.append((("● " if name == active else "   ") + name, lambda chosen=name: self.activate_group(chosen)))
+        active = int(self.library.get("active_group") or 0)
+        for group in self.library.get("groups") or []:
+            name = str(group.get("name") or "")
+            gid = int(group["id"])
+            rows.append((("● " if gid == active else "   ") + name, lambda chosen=gid: self.activate_group(chosen)))
         rows.append(None)
         rows.append(("管理群組", self.choose_shortcuts))
         x, y = cursor_pos()
@@ -3033,342 +3472,351 @@ class ActionBar:
         if self._editors == 0:
             self._apply_exstyle(self.hwnd)
 
+    def _manage_groups(self, parent, refresh) -> None:
+        if self._library_readonly:
+            return
+        dialog = tk.Toplevel(parent)
+        dialog.title("群組")
+        dialog.attributes("-topmost", True)
+        dialog.transient(parent)
+        frame = tk.Frame(dialog, padx=12, pady=12)
+        frame.pack()
+        box = tk.Listbox(frame, width=24, height=10, font=FONT_UI)
+        box.pack()
+        ids: list[int] = []
+
+        def refill() -> None:
+            box.delete(0, "end")
+            ids.clear()
+            for group in self.library.get("groups") or []:
+                box.insert("end", group["name"])
+                ids.append(int(group["id"]))
+
+        def current() -> int | None:
+            picked = box.curselection()
+            if not picked:
+                return None
+            return ids[int(picked[0])]
+
+        def add() -> None:
+            name = simpledialog.askstring("新增群組", "名稱", parent=dialog)
+            error = add_group_row(self.library, name or "")
+            if error:
+                messagebox.showinfo("群組", error, parent=dialog)
+                return
+            self._store()
+            refill()
+            refresh()
+
+        def rename() -> None:
+            gid = current()
+            if gid is None:
+                return
+            name = simpledialog.askstring(
+                "改名", "名稱", parent=dialog, initialvalue=group_name_of(self.library, gid)
+            )
+            error = rename_group_row(self.library, gid, name or "")
+            if error:
+                messagebox.showinfo("群組", error, parent=dialog)
+                return
+            self._store()
+            refill()
+            refresh()
+
+        def remove() -> None:
+            gid = current()
+            if gid is None:
+                return
+            count = ungrouped_if_removed(self.library, gid)
+            if not messagebox.askyesno(
+                "群組",
+                f"刪除「{group_name_of(self.library, gid)}」？\n{count} 個快捷鍵會變成未分組。",
+                parent=dialog,
+            ):
+                return
+            delete_group_row(self.library, gid)
+            self._store()
+            refill()
+            refresh()
+
+        refill()
+        buttons = tk.Frame(frame)
+        buttons.pack(pady=8)
+        tk.Button(buttons, text="新增", command=add).pack(side="left")
+        tk.Button(buttons, text="改名", command=rename).pack(side="left", padx=6)
+        tk.Button(buttons, text="刪除", command=remove).pack(side="left")
+        dialog.lift()
+
     def choose_shortcuts(self) -> None:
+        if self._library_readonly:
+            messagebox.showwarning("快捷鍵", self._library_message or "目前不能修改快捷鍵。")
+            return
         self._begin_modal()
         win = tk.Toplevel(self.root)
-        win.title("選擇要出現的快捷鍵")
-        win.geometry("640x720")
+        win.title("快捷鍵")
+        win.geometry("760x640")
         win.attributes("-topmost", True)
         win.configure(bg="#f6f7f8")
-        style = ttk.Style(win)
-        style.configure("TNotebook.Tab", font=FONT_UI, padding=(12, 4))
-        query = tk.StringVar()
-        group_var = tk.StringVar(value=str(self.library.get("active") or "一般"))
-        header = tk.Frame(win, bg="#f6f7f8")
-        header.pack(fill="x", padx=12, pady=(10, 0))
-        tk.Label(header, text="勾選要出現在列上的快捷鍵", bg="#f6f7f8", font=FONT_UI).pack(side="left")
-        count = tk.Label(header, text="", bg="#f6f7f8", fg="#5f6368", font=FONT_HINT)
-        count.pack(side="right")
-        groups = tk.Frame(win, bg="#f6f7f8")
-        groups.pack(fill="x", padx=12, pady=(8, 0))
-        tk.Label(groups, text="群組", bg="#f6f7f8", font=FONT_UI).pack(side="left")
-        combo = ttk.Combobox(groups, textvariable=group_var, state="readonly", width=16, font=FONT_UI)
-        combo.pack(side="left", padx=(8, 0))
-        tk.Entry(win, textvariable=query, font=FONT_UI).pack(fill="x", padx=12, pady=8)
-        actions = tk.Frame(win, bg="#f6f7f8")
-        actions.pack(side="bottom", fill="x", padx=12, pady=10)
-        book = ttk.Notebook(win)
-        book.pack(fill="both", expand=True, padx=12, pady=(0, 4))
-        page_all = tk.Frame(book, bg="#f6f7f8")
-        page_on = tk.Frame(book, bg="#f6f7f8")
-        book.add(page_all, text="全部")
-        book.add(page_on, text="已勾選")
-        canvas = tk.Canvas(page_all, bg="#f6f7f8", highlightthickness=0)
-        scroll = tk.Scrollbar(page_all, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        inner = tk.Frame(canvas, bg="#f6f7f8")
-        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-        variables: list[tuple[str, tk.BooleanVar, dict, bool]] = []
-        sections: list[dict] = []
-        rename_job: dict[str, str] = {}
-        state = {"building": False}
+        outer = tk.Frame(win, bg="#f6f7f8", padx=12, pady=12)
+        outer.pack(fill="both", expand=True)
+        top = tk.Frame(outer, bg="#f6f7f8")
+        top.pack(fill="x")
+        tk.Label(top, text="群組", bg="#f6f7f8", font=FONT_UI).pack(side="left")
+        filter_var = tk.StringVar(value="全部")
+        filter_box = ttk.Combobox(top, textvariable=filter_var, state="readonly", width=16)
+        filter_box.pack(side="left", padx=(6, 12))
+        tk.Label(top, text="搜尋", bg="#f6f7f8", font=FONT_UI).pack(side="left")
+        search_var = tk.StringVar()
+        tk.Entry(top, textvariable=search_var, font=FONT_UI, width=24).pack(side="left", padx=6)
+        manage_btn = tk.Button(top, text="群組管理…")
+        manage_btn.pack(side="right")
 
-        def refresh_groups() -> None:
-            combo["values"] = [item["name"] for item in self.library.get("profiles") or []]
-            group_var.set(str(self.library.get("active") or "一般"))
+        tree = ttk.Treeview(outer, columns=("hotkey", "name", "groups"), show="headings", height=12)
+        tree.heading("hotkey", text="快捷鍵")
+        tree.heading("name", text="名稱")
+        tree.heading("groups", text="群組")
+        tree.column("hotkey", width=180, anchor="w")
+        tree.column("name", width=160, anchor="w")
+        tree.column("groups", width=280, anchor="w")
+        tree.pack(fill="both", expand=True, pady=8)
 
-        def refresh_count() -> None:
-            checked = sum(1 for item in self.shortcuts if item.get("enabled"))
-            count.configure(text=f"{checked} / {len(self.shortcuts)}")
+        form = tk.Frame(outer, bg="#f6f7f8")
+        form.pack(fill="x")
+        mods = {name: tk.BooleanVar() for name in ("ctrl", "shift", "alt", "win")}
+        mod_row = tk.Frame(form, bg="#f6f7f8")
+        mod_row.pack(fill="x", pady=2)
+        for name, label in (("ctrl", "Ctrl"), ("shift", "Shift"), ("alt", "Alt"), ("win", "Win")):
+            tk.Checkbutton(
+                mod_row, text=label, variable=mods[name], bg="#f6f7f8",
+                command=lambda: preview(),
+            ).pack(side="left", padx=4)
+        key_row = tk.Frame(form, bg="#f6f7f8")
+        key_row.pack(fill="x", pady=4)
+        tk.Label(key_row, text="主鍵", bg="#f6f7f8", font=FONT_UI).pack(side="left")
+        key_var = tk.StringVar()
+        key_by_label: dict[str, str] = {}
+        key_labels = []
+        for name in KEY_VK:
+            label = "`" if name == "backquote" else DISPLAY_KEY.get(name, name)
+            if label in key_by_label and key_by_label[label] != name:
+                label = name
+            key_by_label[label] = name
+            key_labels.append(label)
+        key_labels.sort(key=str.lower)
+        key_box = ttk.Combobox(key_row, textvariable=key_var, state="readonly", values=key_labels, width=18)
+        key_box.pack(side="left", padx=6)
+        capture_btn = tk.Button(key_row, text="按下主鍵")
+        capture_btn.pack(side="left")
+        preview_var = tk.StringVar(value="預覽：")
+        tk.Label(key_row, textvariable=preview_var, bg="#f6f7f8", font=FONT_UI).pack(side="left", padx=8)
+        name_var = tk.StringVar()
+        tk.Label(form, text="名稱", bg="#f6f7f8", font=FONT_UI).pack(anchor="w")
+        tk.Entry(form, textvariable=name_var, font=FONT_UI).pack(fill="x", pady=(0, 6))
+        group_host = tk.Frame(form, bg="#f6f7f8")
+        group_host.pack(fill="x")
+        group_vars: dict[int, tk.BooleanVar] = {}
+        selected = {"id": None}
+        capturing = {"on": False, "bind": None}
 
-        def checked_only() -> bool:
+        def current_hotkey() -> str | None:
+            key_name = key_by_label.get(key_var.get())
+            if not key_name:
+                return None
+            chosen = [name for name in MOD_ORDER if mods[name].get()]
             try:
-                return book.index(book.select()) == 1
-            except tk.TclError:
-                return False
+                return canonical_hotkey("+".join([*chosen, key_name]))
+            except ValueError:
+                return None
 
-        def mount(_event=None) -> None:
-            parent = page_on if checked_only() else page_all
-            scroll.pack_forget()
-            canvas.pack_forget()
-            scroll.pack(in_=parent, side="right", fill="y")
-            canvas.pack(in_=parent, side="left", fill="both", expand=True)
-            apply_filter()
+        def preview(*_args) -> None:
+            hotkey = current_hotkey()
+            preview_var.set("預覽：" + (format_hotkey(hotkey) if hotkey else "（尚未選擇主鍵）"))
 
-        def apply_filter(*_args) -> None:
-            if state["building"]:
-                return
-            needle = query.get().strip().lower()
-            only = checked_only()
-            for child in inner.winfo_children():
-                child.pack_forget()
-            shown = False
-            for info in sections:
-                visible = []
-                for row, search, var in info["rows"]:
-                    if needle and needle not in search["text"]:
-                        continue
-                    if only and not var.get():
-                        continue
-                    visible.append(row)
-                if not visible:
+        def selected_groups() -> list[int]:
+            return [gid for gid, var in group_vars.items() if var.get()]
+
+        def rebuild_groups(keep: list[int] | None = None) -> None:
+            for child in group_host.winfo_children():
+                child.destroy()
+            group_vars.clear()
+            tk.Label(group_host, text="群組", bg="#f6f7f8", font=FONT_UI).pack(anchor="w")
+            row = tk.Frame(group_host, bg="#f6f7f8")
+            row.pack(fill="x")
+            for group in self.library.get("groups") or []:
+                var = tk.BooleanVar(value=int(group["id"]) in (keep or []))
+                group_vars[int(group["id"])] = var
+                tk.Checkbutton(row, text=group["name"], variable=var, bg="#f6f7f8").pack(side="left", padx=3)
+            names = ["全部", "未分組"] + [str(group["name"]) for group in self.library.get("groups") or []]
+            filter_box["values"] = names
+            if filter_var.get() not in names:
+                filter_var.set("全部")
+
+        def group_text(item: dict) -> str:
+            labels = [group_name_of(self.library, int(gid)) for gid in item.get("groups") or []]
+            return "、".join(label for label in labels if label) or "未分組"
+
+        def refresh(*_args) -> None:
+            children = tree.get_children()
+            if children:
+                tree.delete(*children)
+            query = search_var.get().strip().lower()
+            chosen = filter_var.get()
+            for item in self.library.get("shortcuts") or []:
+                linked = [int(gid) for gid in item.get("groups") or []]
+                if chosen == "未分組" and linked:
                     continue
-                shown = True
-                info["header"].pack(anchor="w", pady=(8, 2))
-                for row in visible:
-                    row.pack(fill="x")
-            if not shown:
-                empty.pack(anchor="w", pady=12)
-
-        def flush() -> None:
-            by_id = {item["id"]: item for item in self.shortcuts}
-            for id_, var, search, builtin in variables:
-                item = by_id.get(id_)
-                if item is None:
+                if chosen not in ("全部", "未分組"):
+                    group = next((row for row in self.library["groups"] if row["name"] == chosen), None)
+                    if group is None or int(group["id"]) not in linked:
+                        continue
+                try:
+                    shown = format_hotkey(item["hotkey"])
+                except ValueError:
+                    shown = str(item.get("hotkey") or "")
+                blob = f"{shown} {item.get('name') or ''} {item.get('hotkey') or ''}".lower()
+                if query and query not in blob:
                     continue
-                if not builtin and search.get("name") is not None:
-                    item["label"] = str(search["name"].get()).strip()
-                item["enabled"] = bool(var.get())
-            self._capture_active()
+                tree.insert("", "end", iid=str(item["id"]), values=(shown, item.get("name") or "", group_text(item)))
 
-        def apply_now() -> None:
-            if state["building"]:
+        def load_selected(_event=None) -> None:
+            picked = tree.focus()
+            if not picked:
                 return
-            flush()
-            save_library(self.library)
-            self._shortcuts_mtime = shortcuts_mtime()
-            refresh_count()
-            self.relayout()
-            apply_filter()
-
-        def commit_name(item: dict, name_var: tk.StringVar) -> None:
-            rename_job.pop(item["id"], None)
-            if state["building"] or all(current is not item for current in self.shortcuts):
+            item = shortcut_by_id(self.library, int(picked))
+            if item is None:
                 return
-            item["label"] = name_var.get().strip()
-            self._save_shortcuts()
-            if item.get("enabled"):
-                self.relayout()
-
-        def schedule_name(item: dict, name_var: tk.StringVar) -> None:
-            previous = rename_job.get(item["id"])
-            if previous:
-                try:
-                    win.after_cancel(previous)
-                except tk.TclError:
-                    pass
-            rename_job[item["id"]] = win.after(200, lambda current=item, source=name_var: commit_name(current, source))
-
-        def cancel_renames() -> None:
-            for job in rename_job.values():
-                try:
-                    win.after_cancel(job)
-                except tk.TclError:
-                    pass
-            rename_job.clear()
-
-        empty = tk.Label(inner, text="這個頁籤沒有符合的快捷鍵", bg="#f6f7f8", fg="#5f6368", font=FONT_UI)
-
-        def rebuild() -> None:
-            state["building"] = True
-            cancel_renames()
-            for child in list(inner.winfo_children()):
-                if child is not empty:
-                    child.destroy()
-            variables.clear()
-            sections.clear()
-            group = None
-            section: dict | None = None
-            for item in self.shortcuts:
-                group_name = item["group"]
-                if group_name != group:
-                    group = group_name
-                    title = tk.Label(
-                        inner,
-                        text=group_name,
-                        bg="#f6f7f8",
-                        fg="#174ea6",
-                        font=("Microsoft JhengHei UI", 10, "bold"),
-                    )
-                    section = {"header": title, "rows": []}
-                    sections.append(section)
-                shown = format_hotkey(item["hotkey"])
-                search = {"text": f"{item.get('label') or ''} {shown}".lower(), "name": None}
-                row = tk.Frame(inner, bg="#f6f7f8")
-                var = tk.BooleanVar(value=bool(item.get("enabled")))
-                tick = tk.Checkbutton(
-                    row,
-                    text=item["label"] if item.get("builtin") else "",
-                    variable=var,
-                    bg="#f6f7f8",
-                    activebackground="#f6f7f8",
-                    font=FONT_UI,
-                    anchor="w",
-                    width=14 if item.get("builtin") else 0,
-                    command=apply_now,
-                )
-                tick.pack(side="left")
-                if not item.get("builtin"):
-                    name_var = tk.StringVar(value=item.get("label") or "")
-                    search["name"] = name_var
-                    entry = tk.Entry(row, textvariable=name_var, font=FONT_UI, width=14)
-                    entry.pack(side="left", padx=(0, 6))
-                    name_var.trace_add(
-                        "write",
-                        lambda *_args, current=item, source=name_var, box=search: (
-                            box.update({"text": f"{source.get()} {format_hotkey(current['hotkey'])}".lower()}),
-                            schedule_name(current, source),
-                        ),
-                    )
-                tk.Label(row, text=shown, bg="#f6f7f8", fg="#5f6368", font=FONT_HINT, anchor="w").pack(side="left")
-                variables.append((item["id"], var, search, bool(item.get("builtin"))))
-                section["rows"].append((row, search, var))
-            state["building"] = False
-            refresh_groups()
-            refresh_count()
-            apply_filter()
-            canvas.yview_moveto(0)
-
-        def use_group(name: str) -> None:
-            if state["building"] or name == self.library.get("active"):
-                return
-            if not any(item.get("name") == name for item in self.library.get("profiles") or []):
-                return
-            flush()
-            self.library["active"] = name
-            self.shortcuts = materialize(self.library)
-            save_library(self.library)
-            self._shortcuts_mtime = shortcuts_mtime()
-            self.relayout()
-            rebuild()
-
-        def add_group() -> None:
-            name = simpledialog.askstring("新增群組", "應用程式名稱", parent=win)
-            if not name or not str(name).strip():
-                return
-            name = str(name).strip()
-            if any(item.get("name") == name for item in self.library.get("profiles") or []):
-                messagebox.showerror("群組", "這個名稱已經有了。", parent=win)
-                return
-            flush()
-            source = next((item for item in self.library["profiles"] if item.get("name") == "一般"), empty_profile("一般"))
-            self.library["profiles"].append(
-                empty_profile(
-                    name,
-                    list(source.get("enabled") or []),
-                    dict(source.get("names") or {}),
-                    list(source.get("pins") or []),
-                )
-            )
-            self.library["active"] = name
-            self.shortcuts = materialize(self.library)
-            save_library(self.library)
-            self._shortcuts_mtime = shortcuts_mtime()
-            self.relayout()
-            rebuild()
-
-        def delete_group() -> None:
-            name = str(self.library.get("active") or "")
-            if name in BUILTIN_GROUPS:
-                messagebox.showinfo("群組", "一般和瀏覽器不能刪除。", parent=win)
-                return
-            if not messagebox.askyesno("群組", f"刪除「{name}」？", parent=win):
-                return
-            self.library["profiles"] = [item for item in self.library["profiles"] if item.get("name") != name]
-            self.library["active"] = "一般"
-            self.shortcuts = materialize(self.library)
-            save_library(self.library)
-            self._shortcuts_mtime = shortcuts_mtime()
-            self.relayout()
-            rebuild()
-
-        def save_file() -> None:
-            flush()
-            path = filedialog.asksaveasfilename(
-                parent=win,
-                title="儲存快捷鍵設定",
-                defaultextension=".json",
-                filetypes=[("JSON", "*.json")],
-                initialfile="快捷鍵設定.json",
-            )
-            if not path:
-                return
-            Path(path).write_text(json.dumps(self.library, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-        def load_file() -> None:
-            path = filedialog.askopenfilename(
-                parent=win,
-                title="載入快捷鍵設定",
-                filetypes=[("JSON", "*.json")],
-            )
-            if not path:
-                return
+            selected["id"] = int(picked)
             try:
-                data = json.loads(Path(path).read_text(encoding="utf-8"))
-            except Exception:
-                messagebox.showerror("載入", "這個檔案讀不起來。", parent=win)
+                mod_names, key = parse_hotkey(item["hotkey"])
+            except ValueError:
                 return
-            if isinstance(data, dict) and isinstance(data.get("profiles"), list):
-                library = normalize_library(data)
-            elif isinstance(data, dict) and "shortcuts" in data:
-                library = library_from_legacy(data)
+            for name in mods:
+                mods[name].set(name in mod_names)
+            key_var.set("`" if key == "backquote" else DISPLAY_KEY.get(key, key))
+            name_var.set(item.get("name") or "")
+            for gid, var in group_vars.items():
+                var.set(gid in (item.get("groups") or []))
+            preview()
+
+        def clear_form() -> None:
+            selected["id"] = None
+            tree.selection_remove(tree.selection())
+            for var in mods.values():
+                var.set(False)
+            key_var.set("")
+            name_var.set("")
+            for var in group_vars.values():
+                var.set(False)
+            preview()
+
+        def apply_edit(creating: bool) -> None:
+            hotkey = current_hotkey()
+            if not hotkey:
+                messagebox.showinfo("快捷鍵", "請選擇主鍵。", parent=win)
+                return
+            if creating:
+                error = add_shortcut(self.library, hotkey, name_var.get(), selected_groups())
             else:
-                messagebox.showerror("載入", "這不是快捷鍵設定檔。", parent=win)
+                if selected["id"] is None:
+                    messagebox.showinfo("快捷鍵", "請先選一筆再儲存修改。", parent=win)
+                    return
+                error = update_shortcut(
+                    self.library, int(selected["id"]), hotkey, name_var.get(), selected_groups()
+                )
+            if error:
+                messagebox.showinfo("快捷鍵", error, parent=win)
                 return
-            self.library = library
-            self.shortcuts = materialize(self.library)
-            save_library(self.library)
-            self._shortcuts_mtime = shortcuts_mtime()
-            self.relayout()
-            rebuild()
+            self._store()
+            refresh()
+            if creating:
+                clear_form()
 
-        def on_group(_event=None) -> None:
-            use_group(group_var.get())
+        def remove_selected() -> None:
+            if selected["id"] is None:
+                return
+            if not messagebox.askyesno("快捷鍵", "刪除這一筆？格子裡若有用到也會清掉。", parent=win):
+                return
+            delete_shortcut(self.library, int(selected["id"]))
+            selected["id"] = None
+            self._store()
+            refresh()
 
-        query.trace_add("write", apply_filter)
-        combo.bind("<<ComboboxSelected>>", on_group)
-        book.bind("<<NotebookTabChanged>>", mount)
-        tk.Button(groups, text="新增", command=add_group).pack(side="left", padx=(8, 0))
-        tk.Button(groups, text="刪除", command=delete_group).pack(side="left", padx=6)
+        def stop_capture() -> None:
+            capturing["on"] = False
+            self._capturing = False
+            if capturing["bind"] is not None:
+                capturing["bind"] = None
+                try:
+                    win.unbind_all("<KeyPress>")
+                except tk.TclError:
+                    pass
+            try:
+                if capture_btn.winfo_exists():
+                    capture_btn.configure(text="按下主鍵")
+            except tk.TclError:
+                pass
 
-        def on_configure(_event=None) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
+        def on_key(event):
+            if not capturing["on"]:
+                return
+            code = int(getattr(event, "keycode", 0) or 0)
+            if code == 27 or str(getattr(event, "keysym", "")) == "Escape":
+                stop_capture()
+                return "break"
+            if code in MODIFIER_KEYCODES:
+                return "break"
+            name = VK_TO_KEY.get(code)
+            if name:
+                key_var.set("`" if name == "backquote" else DISPLAY_KEY.get(name, name))
+                preview()
+                stop_capture()
+            return "break"
 
-        def on_canvas(event) -> None:
-            canvas.itemconfigure(window_id, width=event.width)
-
-        def on_wheel(event) -> None:
-            canvas.yview_scroll(int(-event.delta / 120), "units")
-
-        inner.bind("<Configure>", on_configure)
-        canvas.bind("<Configure>", on_canvas)
-        win.bind("<MouseWheel>", on_wheel)
-
-        def set_all(value: bool) -> None:
-            for _id, var, _search, builtin in variables:
-                if builtin:
-                    var.set(value)
-            apply_now()
+        def toggle_capture() -> None:
+            if capturing["on"]:
+                stop_capture()
+                return
+            capturing["on"] = True
+            self._capturing = True
+            capture_btn.configure(text="擷取中，Esc 取消")
+            win.lift()
+            try:
+                win.focus_force()
+            except tk.TclError:
+                pass
+            capturing["bind"] = win.bind_all("<KeyPress>", on_key)
 
         def close() -> None:
-            cancel_renames()
-            flush()
-            save_library(self.library)
-            self._shortcuts_mtime = shortcuts_mtime()
-            if win.winfo_exists():
-                win.destroy()
-            self._end_modal()
-            self.relayout()
+            try:
+                stop_capture()
+            finally:
+                try:
+                    if win.winfo_exists():
+                        win.destroy()
+                except tk.TclError:
+                    pass
+                self._end_modal()
+                self.shortcuts = materialize(self.library)
+                self.relayout()
 
-        tk.Button(actions, text="全部顯示", command=lambda: set_all(True)).pack(side="left")
-        tk.Button(actions, text="全部隱藏", command=lambda: set_all(False)).pack(side="left", padx=6)
-        tk.Button(actions, text="儲存", command=save_file).pack(side="left", padx=(12, 0))
-        tk.Button(actions, text="載入", command=load_file).pack(side="left", padx=6)
-        tk.Button(actions, text="關閉", command=close).pack(side="right")
+        capture_btn.configure(command=toggle_capture)
+        manage_btn.configure(command=lambda: self._manage_groups(
+            win, lambda: (rebuild_groups(selected_groups()), refresh())
+        ))
+        buttons = tk.Frame(outer, bg="#f6f7f8")
+        buttons.pack(fill="x", pady=(8, 0))
+        tk.Button(buttons, text="新增", command=lambda: apply_edit(True)).pack(side="left")
+        tk.Button(buttons, text="儲存修改", command=lambda: apply_edit(False)).pack(side="left", padx=6)
+        tk.Button(buttons, text="刪除", command=remove_selected).pack(side="left")
+        tk.Button(buttons, text="清空表單", command=clear_form).pack(side="left", padx=6)
+        tk.Button(buttons, text="關閉", command=close).pack(side="right")
+        tree.bind("<<TreeviewSelect>>", load_selected)
+        search_var.trace_add("write", lambda *_args: refresh())
+        filter_box.bind("<<ComboboxSelected>>", refresh)
+        key_box.bind("<<ComboboxSelected>>", lambda _event: preview())
         win.protocol("WM_DELETE_WINDOW", close)
-        rebuild()
+        rebuild_groups()
+        refresh()
         win.lift()
         win.focus_force()
 
@@ -3483,12 +3931,16 @@ class ActionBar:
         self.root.wait_window(win)
         return result["value"]
 
-    def hide_spec(self, spec: dict) -> None:
-        for item in self.shortcuts:
-            if item["id"] == spec["id"]:
-                item["enabled"] = False
-                break
-        self._save_shortcuts()
+    def remove_from_group(self, spec: dict) -> None:
+        if self._editors or self._library_readonly:
+            return
+        item = self._by_id.get(int(spec.get("id") or 0))
+        gid = int(self.library.get("active_group") or 0)
+        if item is None or gid not in (item.get("groups") or []):
+            return
+        item["groups"] = [int(value) for value in item["groups"] if int(value) != gid]
+        self._store()
+        self.shortcuts = materialize(self.library)
         self.relayout()
 
     def _close_menu(self) -> None:
@@ -3598,7 +4050,7 @@ class ActionBar:
         self._open_menu(event.x_root, event.y_root, self._bar_rows())
 
     def _open_key_menu(self, event, spec: dict) -> None:
-        rows = [("不要顯示這個", lambda item=spec: self.hide_spec(item))]
+        rows = [("從這個群組移除", lambda item=spec: self.remove_from_group(item))]
         self._open_menu(event.x_root, event.y_root, rows)
 
     def _ensure_tray(self) -> None:
